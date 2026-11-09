@@ -341,6 +341,39 @@ async def cmd_diag(message: Message) -> None:
     cpath = downloader._resolve_cookies_file() or downloader._cookies_from_b64()
     pot = (os.getenv("POT_PROVIDER_URL") or "").strip()
     js = ",".join(downloader._js_runtimes() or ["нет"]) or "нет"
+
+    def _plugin_loaded() -> str:
+        import importlib.util
+        for name in (
+            "bgutil_ytdlp_pot_provider",
+            "yt_dlp_plugins.extractor.bgutil_ytdlp_pot_provider",
+        ):
+            try:
+                if importlib.util.find_spec(name):
+                    return "есть"
+            except Exception:
+                pass
+        try:
+            import yt_dlp_plugins  # type: ignore
+            import os as _os
+            root = _os.path.dirname(yt_dlp_plugins.__file__)
+            for dirpath, _, files in _os.walk(root):
+                if any("bgutil" in f.lower() or "pot" in f.lower() for f in files):
+                    return "есть (yt_dlp_plugins)"
+        except Exception:
+            pass
+        return "НЕТ (плагин не установлен)"
+
+    pot_http = "—"
+    if pot:
+        try:
+            import requests as _rq
+            r = _rq.get(pot, timeout=8, headers={"User-Agent": "aurasaver-diag"})
+            pot_http = f"HTTP {r.status_code}"
+        except Exception as exc:
+            pot_http = "НЕ ОТВЕЧАЕТ: " + str(exc)[:80]
+
+    plugin = _plugin_loaded()
     lines = [
         "<b>🔍 Диагностика</b>",
         f"yt-dlp: <code>{yt_dlp.version.__version__}</code>",
@@ -348,7 +381,9 @@ async def cmd_diag(message: Message) -> None:
         f"JS-рантаймы: <code>{html.escape(js)}</code>",
         f"cookies: <code>{'есть' if cpath else 'НЕТ'}</code>",
         f"YOUTUBE_COOKIES: <code>{html.escape(os.getenv('YOUTUBE_COOKIES') or 'auto')}</code>",
-        f"POT_PROVIDER_URL: <code>{'есть' if pot else 'НЕТ'}</code>",
+        f"POT_PROVIDER_URL: <code>{html.escape(pot[:70]) if pot else 'НЕТ'}</code>",
+        f"PO провайдер HTTP: <code>{html.escape(pot_http)}</code>",
+        f"плагин bgutil: <code>{plugin}</code>",
     ]
     text = message.text or ""
     m = re.search(r"https?://\S+", text)
@@ -380,10 +415,23 @@ async def cmd_diag(message: Message) -> None:
 
     verdict = "\n".join(results)
     if all(("🚫" in r or "❌" in r) for r in results):
-        verdict += (
-            "\n\n💡 Рабочих форматов нет ни у одного клиента — это блок SABR на IP. "
-            "Нужен рабочий PO Token или другой хостинг (VPS)."
-        )
+        if "НЕТ" in plugin:
+            verdict += (
+                "\n\n💡 Плагин bgutil не установлен — POT_PROVIDER_URL сам по себе ничего не даёт. "
+                "Залей requirements.txt и сделай Manual Deploy → Clear build cache & deploy."
+            )
+        elif "НЕ ОТВЕЧАЕТ" in pot_http or pot_http == "—":
+            verdict += (
+                "\n\n💡 Провайдер не отвечает: сервис спит, не задан порт 4416, "
+                "или URL неправильный. Открой адрес провайдера в браузере."
+            )
+        else:
+            verdict += (
+                "\n\n💡 Плагин и провайдер на месте, но форматов нет. "
+                "На датацентровом IP YouTube часто требует И токен, И свежие cookies "
+                "(экспорт из инкогнито). Если cookies старые — обнови COOKIES_B64. "
+                "Либо переезжай на VPS."
+            )
     try:
         await status.edit_text("\n".join(lines) + "\n\n" + verdict)
     except Exception:
