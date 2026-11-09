@@ -20,6 +20,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
 UPDATE_STATE_FILE = os.path.join(BASE_DIR, "ytdlp_update.json")
 
+log = logging.getLogger("downloader")
+
+# Клиенты YouTube, которые чаще всего ещё отдают DASH/HTTPS-форматы.
+# web/mweb часто отдают только SABR/storyboard и ломают селектор формата
+# («Requested format is not available») — особенно с серверных IP (Render и др.).
+FALLBACK_CLIENTS: tuple[str, ...] = (
+    "visionos", "tv_samsung", "android_vr", "android", "mweb", "web_safari",
+)
+# Последний шанс: клиенты, которые иногда дают хотя бы 360p (itag 18).
+LIFELINE_CLIENTS: tuple[str, ...] = ("android", "android_vr", "visionos")
+
 OUTTMPL = "%(title).100B [%(id)s].%(ext)s"
 
 QUALITIES = (360, 480, 720, 1080)
@@ -478,6 +489,149 @@ def build_format_expr(max_height: int) -> str:
         )
     return f"b[ext=mp4][height<={max_height}]/b[height<={max_height}]/b"
 
+def _env_clients() -> list[str] | None:
+    raw = (os.environ.get("YT_PLAYER_CLIENTS") or "").strip()
+    if not raw:
+        return None
+    items = [c.strip() for c in raw.replace(";", ",").split(",") if c.strip()]
+    return items or None
+
+
+def _js_runtimes() -> dict[str, dict] | None:
+    """Включаем найденные JS-рантаймы: без них YouTube часто не отдаёт форматы.
+
+    yt-dlp по умолчанию использует только deno. Если на сервере есть node —
+    его нужно включить явно.
+    """
+    override = (os.environ.get("YTDLP_JS_RUNTIME") or "").strip().lower()
+    if override in ("none", "no", "off"):
+        return None
+    names = [override] if override else ("deno", "node", "bun", "quickjs")
+    found: dict[str, dict] = {}
+    for name in names:
+        if shutil.which(name):
+            found[name] = {}
+    return found or None
+
+
+def _base_opts(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 30,
+        "geo_bypass": True,
+    }
+    js = _js_runtimes()
+    if js:
+        opts["js_runtimes"] = js
+    if extra:
+        opts.update(extra)
+    pot = _pot_extractor_args()
+    if pot:
+        _merge_pot(opts)
+    return opts
+
+
+def _apply_clients(opts: dict[str, Any], clients: list[str] | None) -> None:
+    if not clients:
+        return
+    ea = dict(opts.get("extractor_args") or {})
+    yt = dict(ea.get("youtube") or {})
+    yt["player_client"] = list(clients)
+    ea["youtube"] = yt
+    opts["extractor_args"] = ea
+
+
+def _is_storyboard(f: dict) -> bool:
+    if f.get("protocol") == "mhtml" or (f.get("ext") or "").lower() == "mhtml":
+        return True
+    return "storyboard" in (f.get("format_note") or "").lower()
+
+
+def _is_av_format(f: dict) -> bool:
+    if _is_storyboard(f):
+        return False
+    if (f.get("ext") or "").lower() in ("jpg", "jpeg", "png", "webp", "gif"):
+        return False
+    has_v = f.get("vcodec") not in (None, "none")
+    has_a = f.get("acodec") not in (None, "none")
+    return has_v or has_a
+
+
+def _client_chains() -> list[list[str] | None]:
+    env = _env_clients()
+    if env:
+        extra = [c for c in FALLBACK_CLIENTS if c not in env]
+        return [env, env + extra, list(LIFELINE_CLIENTS)]
+    return [
+        None,
+        list(FALLBACK_CLIENTS),
+        list(LIFELINE_CLIENTS),
+        ["mweb", "web_safari", "web"],
+    ]
+
+
+def friendly_error(exc: BaseException) -> str:
+    """Человекочитаемая ошибка вместо сырого лога yt-dlp."""
+    raw = (str(exc) or "").strip()
+    last = raw.splitlines()[-1] if raw else type(exc).__name__
+    blob = (raw + "\n" + last).lower()
+    if "requested format is not available" in blob or "use --list-formats" in blob:
+        return (
+            "YouTube не отдал рабочих форматов (SABR / PO Token на этом IP). "
+            "Попробуйте ещё раз, смените IP/прокси или настройте PO Token "
+            "провайдер — см. README_RENDER.md."
+        )
+    if "sign in to confirm" in blob or "not a bot" in blob:
+        return "YouTube просит подтвердить, что вы не бот — нужен cookies (COOKIES_B64, см. README_RENDER)."
+    if "the page needs to be reloaded" in blob:
+        return "YouTube попросил перезагрузить страницу. Отправьте ссылку ещё раз."
+    if "unavailable" in blob or "video unavailable" in blob:
+        return "Видео недоступно: удалено, приватное или заблокировано в регионе."
+    return last[:300]
+
+
+def _retryable_download_error(exc: BaseException) -> bool:
+    blob = str(exc).lower()
+    return any(
+        k in blob
+        for k in (
+            "requested format is not available",
+            "no video formats",
+            "sign in to confirm",
+            "not a bot",
+            "the page needs to be reloaded",
+            "http error 403",
+            "unplayable",
+            "login_required",
+            "sabr",
+        )
+    )
+
+
+def _ffmpeg_flag(opts: dict[str, Any]) -> None:
+    ffmpeg_path = _find_ffmpeg()
+    if ffmpeg_path and not os.path.isdir(ffmpeg_path.lstrip('"')):
+        opts["ffmpeg_location"] = ffmpeg_path
+
+
+def _pot_extractor_args() -> dict[str, list[str]]:
+    url = (os.environ.get("POT_PROVIDER_URL") or "").strip()
+    if not url:
+        return {}
+    return {"youtubepot-bgutilhttp": {"base_url": [url]}}
+
+
+def _merge_pot(opts: dict[str, Any]) -> None:
+    pot = _pot_extractor_args()
+    if not pot:
+        return
+    ea = dict(opts.get("extractor_args") or {})
+    ea.update(pot)
+    opts["extractor_args"] = ea
+
+
 def _unwrap_playlist(info: dict) -> dict:
     if info.get("_type") in ("playlist", "multi_video"):
         entries = [e for e in (info.get("entries") or []) if e]
@@ -486,20 +640,20 @@ def _unwrap_playlist(info: dict) -> dict:
         return dict(entries[0])
     return info
 
-def get_media_info(url: str, proxy: str | None = None) -> dict:
-    opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "socket_timeout": 30,
-        "geo_bypass": True,
-    }
+def _extract_meta(url: str, proxy: str | None, clients: list[str] | None) -> dict:
+    opts = _base_opts()
+    _apply_clients(opts, clients)
     apply_cookies(opts)
     if proxy:
         opts["proxy"] = proxy
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = _unwrap_playlist(ydl.extract_info(url, download=False))
+        # process=False не запускает селектор формата: YouTube, отдающий
+        # только SABR/storyboard, больше не роняет превью ошибкой
+        # «Requested format is not available».
+        return _unwrap_playlist(ydl.extract_info(url, download=False, process=False))
 
+
+def _media_info_from_raw(info: dict, url: str) -> dict:
     duration = info.get("duration")
     fmts = info.get("formats") or []
     variants: dict[int, tuple[int | None, str]] = {}
@@ -509,6 +663,8 @@ def get_media_info(url: str, proxy: str | None = None) -> dict:
         variants[h] = (est, desc)
         if est:
             has_media = True
+    if not has_media:
+        has_media = any(_is_av_format(f) for f in fmts)
 
     host = host_of(info.get("webpage_url") or url)
 
@@ -532,14 +688,17 @@ def get_media_info(url: str, proxy: str | None = None) -> dict:
         reverse=True,
     )
 
+    only_storyboards = bool(fmts) and not any(_is_av_format(f) for f in fmts)
+    is_yt = "youtube" in host or host == "youtu.be"
     return {
         "title": info.get("title") or "Видео",
         "uploader": info.get("uploader") or info.get("channel") or "",
         "duration": duration,
         "host": host,
-        "live": bool(info.get("is_live")),
+        "live": bool(info.get("is_live")) or info.get("live_status") in ("is_live", "is_upcoming"),
         "variants": variants,
         "no_media": not has_media,
+        "sabr": only_storyboards and is_yt,
         "images": images[:6],
         "cookie_hint": _cookie_hint_needed(host),
         "ffmpeg_ok": ffmpeg_available(),
@@ -547,38 +706,73 @@ def get_media_info(url: str, proxy: str | None = None) -> dict:
         "thumbnails": info.get("thumbnails") or [],
     }
 
-def download(url: str, max_height: int, temp_dir_path: str, reporter: Any, proxy: str | None = None) -> tuple[str, dict]:
+
+def get_media_info(url: str, proxy: str | None = None) -> dict:
+    last_exc: Exception | None = None
+    empty: dict | None = None
+    for clients in _client_chains():
+        try:
+            info = _extract_meta(url, proxy, clients)
+        except yt_dlp.utils.DownloadCancelled:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            log.info(
+                "метаданные (%s): %s",
+                ",".join(clients) if clients else "default",
+                str(exc).splitlines()[-1][:140],
+            )
+            continue
+        if any(_is_av_format(f) for f in (info.get("formats") or [])):
+            return _media_info_from_raw(info, url)
+        if empty is None:
+            empty = info
+
+    # Второй шанс: обычная обработка yt-dlp (нужна части сайтов, не YouTube).
+    try:
+        opts = _base_opts()
+        apply_cookies(opts)
+        if proxy:
+            opts["proxy"] = proxy
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = _unwrap_playlist(ydl.extract_info(url, download=False))
+        if info.get("formats"):
+            return _media_info_from_raw(info, url)
+    except yt_dlp.utils.DownloadCancelled:
+        raise
+    except Exception as exc:
+        last_exc = last_exc or exc
+        log.info("метаданные (process=True): %s", str(exc).splitlines()[-1][:140])
+
+    if empty is not None:
+        return _media_info_from_raw(empty, url)
+    raise last_exc if last_exc else RuntimeError("Не удалось получить данные по ссылке.")
+
+
+def _download_hook(reporter: Any):
     def hook(d: dict) -> None:
         if reporter.cancelled():
             raise yt_dlp.utils.DownloadCancelled("Загрузка отменена пользователем")
         reporter.update(d)
 
-    opts: dict[str, Any] = {
-        "format": build_format_expr(max_height),
-        "merge_output_format": "mp4",
+    return hook
+
+
+def _download_common(temp_dir_path: str, hook) -> dict[str, Any]:
+    opts = _base_opts({
         "outtmpl": {"default": OUTTMPL},
         "paths": {"home": temp_dir_path},
-        "quiet": True,
-        "no_warnings": True,
         "noprogress": True,
-        "socket_timeout": 30,
         "retries": 3,
         "concurrent_fragment_downloads": 8,
         "windowsfilenames": True,
-        "noplaylist": True,
-        "geo_bypass": True,
         "progress_hooks": [hook],
-    }
-    ffmpeg_path = _find_ffmpeg()
-    if ffmpeg_path and not os.path.isdir(ffmpeg_path.lstrip('"')):
-        opts["ffmpeg_location"] = ffmpeg_path
-    apply_cookies(opts)
-    if proxy:
-        opts["proxy"] = proxy
+    })
+    _ffmpeg_flag(opts)
+    return opts
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = _unwrap_playlist(ydl.extract_info(url, download=True))
 
+def _finish_download(info: dict) -> tuple[str, dict]:
     rd = info.get("requested_downloads") or []
     filepath = (rd[0].get("filepath") or rd[0].get("filename")) if rd else None
     if not filepath or not os.path.isfile(filepath):
@@ -588,50 +782,149 @@ def download(url: str, max_height: int, temp_dir_path: str, reporter: Any, proxy
         )
     return filepath, info
 
-def download_audio(url: str, temp_dir_path: str, reporter: Any, proxy: str | None = None) -> tuple[str, dict]:
-    def hook(d: dict) -> None:
-        if reporter.cancelled():
-            raise yt_dlp.utils.DownloadCancelled("Загрузка отменена пользователем")
-        reporter.update(d)
 
-    opts: dict[str, Any] = {
-        "format": "ba[acodec^=mp4a]/ba/b",
-        "outtmpl": {"default": OUTTMPL},
-        "paths": {"home": temp_dir_path},
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "socket_timeout": 30,
-        "retries": 3,
-        "concurrent_fragment_downloads": 8,
-        "windowsfilenames": True,
-        "noplaylist": True,
-        "geo_bypass": True,
-        "progress_hooks": [hook],
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ],
-    }
-    ffmpeg_path = _find_ffmpeg()
-    if ffmpeg_path and not os.path.isdir(ffmpeg_path.lstrip('"')):
-        opts["ffmpeg_location"] = ffmpeg_path
-    apply_cookies(opts)
-    if proxy:
-        opts["proxy"] = proxy
+def _video_attempts(max_height: int) -> list[dict[str, Any]]:
+    env = _env_clients()
+    fb = list(env) if env else list(FALLBACK_CLIENTS)
+    attempts: list[dict[str, Any]] = []
+    first: dict[str, Any] = {"format": build_format_expr(max_height)}
+    if ffmpeg_available():
+        first["merge_output_format"] = "mp4"
+    if env:
+        first["extractor_args"] = {"youtube": {"player_client": list(env)}}
+    attempts.append(first)
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = _unwrap_playlist(ydl.extract_info(url, download=True))
+    if ffmpeg_available():
+        attempts.append({
+            "format": build_format_expr(max_height),
+            "merge_output_format": "mp4",
+            "extractor_args": {"youtube": {"player_client": fb}},
+        })
+        attempts.append({
+            "format_sort": ["vcodec:h264", "quality", "res", "acodec:aac"],
+            "merge_output_format": "mp4",
+            "extractor_args": {"youtube": {"player_client": fb}},
+        })
+        attempts.append({
+            "format": f"bv*+ba/b[height<={max_height}]/b",
+            "merge_output_format": "mp4",
+            "extractor_args": {"youtube": {"player_client": fb}},
+        })
+    else:
+        attempts.append({
+            "format": f"b[ext=mp4][height<={max_height}]/b[height<={max_height}]/b",
+            "extractor_args": {"youtube": {"player_client": fb}},
+        })
+    attempts.append({
+        "format": "b",
+        "extractor_args": {"youtube": {"player_client": list(LIFELINE_CLIENTS)}},
+    })
+    return attempts
 
-    rd = info.get("requested_downloads") or []
-    filepath = (rd[0].get("filepath") or rd[0].get("filename")) if rd else None
-    if filepath and not filepath.lower().endswith(".mp3"):
-        cand = filepath.rsplit(".", 1)[0] + ".mp3"
-        if os.path.isfile(cand):
-            filepath = cand
-    if not filepath or not os.path.isfile(filepath):
-        raise RuntimeError("Аудио-файл не найден (нужен ffmpeg — см. README).")
-    return filepath, info
+
+def download(
+    url: str,
+    max_height: int,
+    temp_dir_path: str,
+    reporter: Any,
+    proxy: str | None = None,
+) -> tuple[str, dict]:
+    hook = _download_hook(reporter)
+    last: Exception | None = None
+    for extra in _video_attempts(max_height):
+        opts = _download_common(temp_dir_path, hook)
+        opts.update(extra)
+        _merge_pot(opts)
+        apply_cookies(opts)
+        if proxy:
+            opts["proxy"] = proxy
+        label = extra.get("format") or extra.get("format_sort") or "?"
+        log.info("скачиваю видео: %s", label)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = _unwrap_playlist(ydl.extract_info(url, download=True))
+            return _finish_download(info)
+        except yt_dlp.utils.DownloadCancelled:
+            raise
+        except Exception as exc:
+            last = exc
+            log.info("попытка не удалась: %s", str(exc).splitlines()[-1][:160])
+            if not _retryable_download_error(exc):
+                raise
+    if last is not None:
+        raise last
+    raise RuntimeError("Не удалось скачать видео.")
+
+
+def _audio_attempts() -> list[dict[str, Any]]:
+    pp = [
+        {
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }
+    ]
+    env = _env_clients()
+    fb = list(env) if env else list(FALLBACK_CLIENTS)
+    first: dict[str, Any] = {"format": "ba[acodec^=mp4a]/ba/b", "postprocessors": pp}
+    if env:
+        first["extractor_args"] = {"youtube": {"player_client": list(env)}}
+    return [
+        first,
+        {
+            "format": "ba[acodec^=mp4a]/ba/b",
+            "postprocessors": pp,
+            "extractor_args": {"youtube": {"player_client": fb}},
+        },
+        {
+            "format": "bestaudio/b",
+            "postprocessors": pp,
+            "extractor_args": {"youtube": {"player_client": fb}},
+        },
+        {
+            "format": "b",
+            "postprocessors": pp,
+            "extractor_args": {"youtube": {"player_client": list(LIFELINE_CLIENTS)}},
+        },
+    ]
+
+
+def download_audio(
+    url: str,
+    temp_dir_path: str,
+    reporter: Any,
+    proxy: str | None = None,
+) -> tuple[str, dict]:
+    hook = _download_hook(reporter)
+    last: Exception | None = None
+    for extra in _audio_attempts():
+        opts = _download_common(temp_dir_path, hook)
+        opts.update(extra)
+        _merge_pot(opts)
+        apply_cookies(opts)
+        if proxy:
+            opts["proxy"] = proxy
+        log.info("скачиваю аудио: %s", extra.get("format") or "?")
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = _unwrap_playlist(ydl.extract_info(url, download=True))
+
+            rd = info.get("requested_downloads") or []
+            filepath = (rd[0].get("filepath") or rd[0].get("filename")) if rd else None
+            if filepath and not filepath.lower().endswith(".mp3"):
+                cand = filepath.rsplit(".", 1)[0] + ".mp3"
+                if os.path.isfile(cand):
+                    filepath = cand
+            if not filepath or not os.path.isfile(filepath):
+                raise RuntimeError("Аудио-файл не найден (нужен ffmpeg — см. README).")
+            return filepath, info
+        except yt_dlp.utils.DownloadCancelled:
+            raise
+        except Exception as exc:
+            last = exc
+            log.info("аудио-попытка не удалась: %s", str(exc).splitlines()[-1][:160])
+            if not _retryable_download_error(exc):
+                raise
+    if last is not None:
+        raise last
+    raise RuntimeError("Не удалось скачать аудио.")

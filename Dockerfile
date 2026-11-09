@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+# ffmpeg — склейка 720p/1080p; nodejs — JS-рантайм для yt-dlp (без него
+# YouTube на серверных IP (Render и др.) часто отдаёт только SABR/storyboard).
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

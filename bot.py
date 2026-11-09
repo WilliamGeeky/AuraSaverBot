@@ -456,18 +456,22 @@ async def _fill_yt_info(preview: Message, pend: dict[str, Any]) -> None:
         pend["failed"] = True
         pend["done"].set()
         if not pend["locked"]:
-            err = html.escape(str(exc).splitlines()[-1][:280])
+            err = html.escape(downloader.friendly_error(exc))
             await _edit_preview(preview, f"❌ Не удалось:\n{err}")
         return
     if info["live"] or info["no_media"]:
         pend["failed"] = True
         pend["done"].set()
         if not pend["locked"]:
-            txt = (
-                "📺 Это прямая трансляция — эфиры записывать не умею."
-                if info["live"]
-                else "🤷 Видео по ссылке не найдено."
-            )
+            if info["live"]:
+                txt = "📺 Это прямая трансляция — эфиры записывать не умею."
+            elif info.get("sabr"):
+                txt = (
+                    "🔧 YouTube пока не отдаёт файлы этого видео (SABR). "
+                    "Попробуйте позже, ещё раз, или добавьте cookies/PO Token (см. README_RENDER)."
+                )
+            else:
+                txt = "🤷 Видео по ссылке не найдено."
             await _edit_preview(preview, txt)
         return
     pend["info"] = info
@@ -493,8 +497,7 @@ async def _slow_preview_flow(message: Message, url: str, user_id: int) -> None:
     try:
         info: dict = await _get_media_info_rotating(url)
     except yt_dlp.utils.DownloadError as exc:
-        err = str(exc).splitlines()[-1][:350]
-        msg = f"❌ Не удалось:\n{html.escape(err)}"
+        msg = f"❌ Не удалось:\n{html.escape(downloader.friendly_error(exc))}"
         if _needs_cookie_hint(url, exc):
             msg += "\n\n💡 YouTube требует вход — положите cookies.txt рядом с ботом (см. README)."
         return await status.edit_text(msg)
@@ -528,6 +531,11 @@ async def _slow_preview_flow(message: Message, url: str, user_id: int) -> None:
             return
 
     if info["no_media"]:
+        if info.get("sabr"):
+            return await status.edit_text(
+                "🔧 YouTube пока не отдаёт файлы этого видео (SABR). "
+                "Попробуйте позже или добавьте cookies/PO Token (см. README_RENDER)."
+            )
         return await status.edit_text("🤷 Видео по ссылке не найдено.")
 
     await _show_preview(message, url, info, user_id)
@@ -561,6 +569,8 @@ def _dl_error_is_rotatable(err: Exception) -> bool:
     low = str(err).lower()
     return any(k in low for k in (
         "not a bot", "proxy", "timed out", "timeout", "connection", "socket", "unavailable", "eof",
+        "requested format is not available", "sabr", "sign in to confirm",
+        "the page needs to be reloaded", "http error 403",
     ))
 
 class _FileTooBig(Exception):
@@ -727,8 +737,7 @@ async def cb_download(cb: CallbackQuery) -> None:
             await _edit_preview(cb.message, f"❌ Telegram: {html.escape(str(exc))[:250]}")
     except Exception as exc:
         log.exception("download failed: %s", exc)
-        err = str(exc).splitlines()[-1][:300]
-        text = f"❌ Ошибка:\n{html.escape(err)}"
+        text = f"❌ Ошибка:\n{html.escape(downloader.friendly_error(exc))}"
         if _needs_cookie_hint(url, exc):
             text += "\n\n💡 YouTube требует вход — попробуйте cookies.txt (см. README)."
         await _edit_preview(cb.message, text)
@@ -804,6 +813,12 @@ async def main() -> None:
     log.info(
         "Загрузок одновременно: %d · yt-dlp %s · прокси в пуле: %d",
         MAX_CONCURRENT, yt_dlp.version.__version__, len(downloader.proxy_pool()),
+    )
+    log.info(
+        "ffmpeg: %s · JS-рантаймы: %s · PO Token: %s",
+        "есть" if downloader.ffmpeg_available() else "НЕТ (720p/1080p не соберутся)",
+        ",".join(downloader._js_runtimes() or ["нет"]) or "нет",
+        "да" if (os.getenv("POT_PROVIDER_URL") or "").strip() else "нет",
     )
     if BOT_PROXY:
         log.info("Telegram API через прокси %s", BOT_PROXY)
