@@ -83,12 +83,108 @@ def _cookie_hint_needed(host: str) -> bool:
     has_cookies = bool(_resolve_cookies_file()) or bool(os.environ.get("COOKIES_FROM_BROWSER"))
     return host in COOKIE_HINT_HOSTS and not has_cookies
 
+def _convert_json_cookies_to_netscape(data: bytes, out_path: str) -> bool:
+    """Расширения часто экспортируют cookies в JSON — yt-dlp умеет только Netscape."""
+    import json
+
+    try:
+        obj = json.loads(data.decode("utf-8", errors="replace"))
+    except Exception:
+        return False
+    items: list = []
+    if isinstance(obj, list):
+        items = obj
+    elif isinstance(obj, dict):
+        for key in ("cookies", "data", "result"):
+            val = obj.get(key)
+            if isinstance(val, list):
+                items = val
+                break
+        else:
+            if isinstance(obj.get("name"), str):
+                items = [obj]
+    if not isinstance(items, list) or not items:
+        return False
+
+    lines = [
+        "# Netscape HTTP Cookie File",
+        "# Converted from JSON by AuraSaver",
+    ]
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or "").strip()
+        if not name:
+            continue
+        value = "" if it.get("value") is None else str(it.get("value"))
+        domain = str(it.get("domain") or it.get("host") or "").strip()
+        if not domain:
+            continue
+        path = str(it.get("path") or "/").strip() or "/"
+        exp = it.get("expirationDate") or it.get("expiry") or it.get("expires") or 2147483647
+        try:
+            exp = int(float(exp))
+        except Exception:
+            exp = 2147483647
+        secure = bool(it.get("secure"))
+        host_only = bool(it.get("hostOnly") or it.get("host_only"))
+        if host_only:
+            if domain.startswith("."):
+                domain = domain[1:]
+            flag_domain = "FALSE"
+        else:
+            if not domain.startswith("."):
+                domain = "." + domain
+            flag_domain = "TRUE"
+        flag_secure = "TRUE" if secure else "FALSE"
+        lines.append(chr(9).join((domain, flag_domain, path, flag_secure, str(exp), name, value)))
+
+    if len(lines) <= 2:
+        return False
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        return False
+    return True
+
+
+def _ensure_netscape_cookies(path: str) -> str:
+    """Если файл — JSON, конвертируем рядом в Netscape и возвращаем новый путь."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8192)
+    except OSError:
+        return path
+    if not head:
+        return path
+    first = head.split(b"\n", 1)[0].lstrip()
+    if first.startswith(b"#") or first.count(b"	") >= 5:
+        return path  # уже Netscape
+    if not first.startswith(b"[") and not first.startswith(b"{"):
+        return path
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return path
+    out = path.rstrip(".") + ".netscape.txt"
+    if _convert_json_cookies_to_netscape(data, out):
+        log.info("Cookies конвертированы из JSON в Netscape: %s", out)
+        return out
+    log.warning("Cookies похожи на JSON, но конвертировать не удалось: %s", path)
+    return path
+
+
 def _resolve_cookies_file() -> str | None:
     name = (os.environ.get("COOKIES_FILE") or "").strip()
     if not name:
         return None
     path = name if os.path.isabs(name) else os.path.join(BASE_DIR, name)
-    return path if os.path.isfile(path) else None
+    if not os.path.isfile(path):
+        return None
+    return _ensure_netscape_cookies(path)
+
 
 def _cookies_from_b64() -> str | None:
     import base64
@@ -103,7 +199,7 @@ def _cookies_from_b64() -> str | None:
         path = os.path.join(tempfile.gettempdir(), "aurasaver_cookies.txt")
         with open(path, "wb") as f:
             f.write(data)
-        return path
+        return _ensure_netscape_cookies(path)
     except Exception:
         return None
 
@@ -582,6 +678,11 @@ def friendly_error(exc: BaseException) -> str:
             "YouTube не отдал рабочих форматов (SABR / PO Token на этом IP). "
             "Попробуйте ещё раз, смените IP/прокси или настройте PO Token "
             "провайдер — см. README_RENDER.md."
+        )
+    if "cookies file must be netscape" in blob or "not json" in blob and "cookies" in blob:
+        return (
+            "Файл cookies не в формате Netscape. Экспортируйте cookies расширением "
+            "«Get cookies.txt LOCALLY» в формате Netscape (не JSON) и обновите COOKIES_B64."
         )
     if "sign in to confirm" in blob or "not a bot" in blob:
         return "YouTube просит подтвердить, что вы не бот — нужен cookies (COOKIES_B64, см. README_RENDER)."
