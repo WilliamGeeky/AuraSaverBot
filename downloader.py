@@ -208,7 +208,13 @@ def is_youtube_url(url: str) -> bool:
     return "youtube" in host or host == "youtu.be"
 
 
-def apply_cookies(opts: dict[str, Any], *, youtube: bool = False) -> None:
+def apply_cookies(
+    opts: dict[str, Any],
+    *,
+    youtube: bool = False,
+    skip: bool = False,
+    want: bool | None = None,
+) -> None:
     """Cookies для YouTube по умолчанию выключены (YOUTUBE_COOKIES=auto).
 
     Авторизованные клиенты YouTube почти всегда отдают только SABR, из-за
@@ -217,9 +223,18 @@ def apply_cookies(opts: dict[str, Any], *, youtube: bool = False) -> None:
     или авторетрай при bot-check.
     """
     mode = (os.environ.get("YOUTUBE_COOKIES") or "auto").strip().lower()
-    force = mode in ("1", "yes", "true", "on", "always")
+    force_env = mode in ("1", "yes", "true", "on", "always")
     never = mode in ("0", "no", "off", "false", "never")
-    use = ((not youtube) or force) and not (never and youtube)
+    if skip or (youtube and never and want is not True):
+        use = False
+    elif want is True:
+        use = True
+    elif want is False:
+        use = False
+    elif youtube:
+        use = force_env
+    else:
+        use = True
     if use:
         cf = _resolve_cookies_file() or _cookies_from_b64()
         if cf:
@@ -774,7 +789,15 @@ def _extract_meta(
 ) -> dict:
     opts = _base_opts()
     _apply_clients(opts, clients)
-    apply_cookies(opts, youtube=is_youtube_url(url) and not yt_cookies)
+    # android / android_vr / visionos cookies не принимают: если их послать,
+    # yt-dlp выкинет эти клиенты и останутся одни SABR-клиенты.
+    cookieless = bool(clients) and not (set(clients) - set(LIFELINE_CLIENTS))
+    apply_cookies(
+        opts,
+        youtube=is_youtube_url(url),
+        skip=cookieless,
+        want=(True if yt_cookies else None),
+    )
     if proxy:
         opts["proxy"] = proxy
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -961,8 +984,9 @@ def _video_attempts(max_height: int) -> list[dict[str, Any]]:
     first: dict[str, Any] = {"format": build_format_expr(max_height)}
     if ffmpeg_available():
         first["merge_output_format"] = "mp4"
-    if env:
-        first["extractor_args"] = {"youtube": {"player_client": list(env)}}
+    first["extractor_args"] = {
+        "youtube": {"player_client": list(env) if env else list(LIFELINE_CLIENTS)}
+    }
     attempts.append(first)
 
     if ffmpeg_available():
@@ -1006,7 +1030,9 @@ def download(
         opts = _download_common(temp_dir_path, hook)
         opts.update(extra)
         _merge_pot(opts)
-        apply_cookies(opts, youtube=is_youtube_url(url))
+        clients_i = ((extra.get("extractor_args") or {}).get("youtube") or {}).get("player_client") or []
+        cookieless = bool(clients_i) and not (set(clients_i) - set(LIFELINE_CLIENTS))
+        apply_cookies(opts, youtube=is_youtube_url(url), skip=cookieless)
         if proxy:
             opts["proxy"] = proxy
         label = extra.get("format") or extra.get("format_sort") or "?"
@@ -1038,8 +1064,9 @@ def _audio_attempts() -> list[dict[str, Any]]:
     env = _env_clients()
     fb = list(env) if env else list(FALLBACK_CLIENTS)
     first: dict[str, Any] = {"format": "ba[acodec^=mp4a]/ba/b", "postprocessors": pp}
-    if env:
-        first["extractor_args"] = {"youtube": {"player_client": list(env)}}
+    first["extractor_args"] = {
+        "youtube": {"player_client": list(env) if env else list(LIFELINE_CLIENTS)}
+    }
     return [
         first,
         {
@@ -1072,7 +1099,9 @@ def download_audio(
         opts = _download_common(temp_dir_path, hook)
         opts.update(extra)
         _merge_pot(opts)
-        apply_cookies(opts, youtube=is_youtube_url(url))
+        clients_i = ((extra.get("extractor_args") or {}).get("youtube") or {}).get("player_client") or []
+        cookieless = bool(clients_i) and not (set(clients_i) - set(LIFELINE_CLIENTS))
+        apply_cookies(opts, youtube=is_youtube_url(url), skip=cookieless)
         if proxy:
             opts["proxy"] = proxy
         log.info("скачиваю аудио: %s", extra.get("format") or "?")
