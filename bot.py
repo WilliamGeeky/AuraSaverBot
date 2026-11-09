@@ -336,6 +336,61 @@ async def cmd_start(message: Message) -> None:
 async def cmd_help(message: Message) -> None:
     await message.answer(WELCOME_TEXT)
 
+@dp.message(Command("diag"))
+async def cmd_diag(message: Message) -> None:
+    cpath = downloader._resolve_cookies_file() or downloader._cookies_from_b64()
+    pot = (os.getenv("POT_PROVIDER_URL") or "").strip()
+    js = ",".join(downloader._js_runtimes() or ["нет"]) or "нет"
+    lines = [
+        "<b>🔍 Диагностика</b>",
+        f"yt-dlp: <code>{yt_dlp.version.__version__}</code>",
+        f"ffmpeg: <code>{'есть' if downloader.ffmpeg_available() else 'НЕТ'}</code>",
+        f"JS-рантаймы: <code>{html.escape(js)}</code>",
+        f"cookies: <code>{'есть' if cpath else 'НЕТ'}</code>",
+        f"YOUTUBE_COOKIES: <code>{html.escape(os.getenv('YOUTUBE_COOKIES') or 'auto')}</code>",
+        f"POT_PROVIDER_URL: <code>{'есть' if pot else 'НЕТ'}</code>",
+    ]
+    text = message.text or ""
+    m = re.search(r"https?://\S+", text)
+    url = m.group(0) if m else "https://www.youtube.com/watch?v=wUrUd5xRkqg"
+    lines.append(f"тест: <code>{html.escape(url[:80])}</code>")
+    status = await message.answer("\n".join(lines) + "\n\n⏳ Тестирую клиенты YouTube…")
+
+    results: list[str] = []
+    variants = [
+        ("lifeline (android/vr/visionos)", list(downloader.LIFELINE_CLIENTS)),
+        ("fallback", list(downloader.FALLBACK_CLIENTS)),
+        ("default", None),
+    ]
+    for label, clients in variants:
+        try:
+            info = await asyncio.wait_for(
+                asyncio.to_thread(downloader._extract_meta, url, None, clients),
+                timeout=50,
+            )
+            fmts = info.get("formats") or []
+            real = [f for f in fmts if downloader._is_av_format(f)]
+            heights = sorted({int(f["height"]) for f in real if f.get("height")})
+            if real:
+                results.append(f"✅ {label}: {len(real)} форматов, высоты {heights[:10]}")
+            else:
+                results.append(f"🚫 {label}: только storyboard (SABR), всего {len(fmts)}")
+        except Exception as exc:
+            results.append(f"❌ {label}: {html.escape(str(exc).splitlines()[-1][:140])}")
+
+    verdict = "\n".join(results)
+    if all(("🚫" in r or "❌" in r) for r in results):
+        verdict += (
+            "\n\n💡 Рабочих форматов нет ни у одного клиента — это блок SABR на IP. "
+            "Нужен рабочий PO Token или другой хостинг (VPS)."
+        )
+    try:
+        await status.edit_text("\n".join(lines) + "\n\n" + verdict)
+    except Exception:
+        await message.answer(verdict)
+
+
+
 @dp.message(Command("q"))
 async def cmd_quality(message: Message) -> None:
     await message.answer(
