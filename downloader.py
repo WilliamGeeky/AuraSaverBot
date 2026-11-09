@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -78,8 +79,25 @@ def _resolve_cookies_file() -> str | None:
     path = name if os.path.isabs(name) else os.path.join(BASE_DIR, name)
     return path if os.path.isfile(path) else None
 
+def _cookies_from_b64() -> str | None:
+    import base64
+    import tempfile
+
+    b64 = re.sub(r"\s+", "", (os.environ.get("COOKIES_B64") or ""))
+    if not b64:
+        return None
+    try:
+        b64 += "=" * (-len(b64) % 4)
+        data = base64.b64decode(b64)
+        path = os.path.join(tempfile.gettempdir(), "aurasaver_cookies.txt")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+    except Exception:
+        return None
+
 def apply_cookies(opts: dict[str, Any]) -> None:
-    cf = _resolve_cookies_file()
+    cf = _resolve_cookies_file() or _cookies_from_b64()
     if cf:
         opts["cookiefile"] = cf
     browser = (os.environ.get("COOKIES_FROM_BROWSER") or "").strip().lower()

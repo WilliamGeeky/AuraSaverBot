@@ -206,25 +206,30 @@ async def _get_media_info_rotating(url: str) -> dict:
                 )
                 if not done:
                     last_exc = TimeoutError(f"прокси не ответили за {METADATA_RACE_TIMEOUT} с")
-                    log.info("Батч прокси молчит %d с — пробую следующий", METADATA_RACE_TIMEOUT)
+                    log.info("Батч прокси молчит %d с - пробую следующий", METADATA_RACE_TIMEOUT)
                     break
+                winner = None
                 for t in done:
                     p = tasks.pop(t)
                     exc = t.exception()
                     if exc is None:
-                        if p and p != PROXY_STATE.get("current"):
-                            PROXY_STATE["current"] = p
-                            log.info("Рабочий прокси: %s", p[:40])
-                        if p:
-                            (PROXY_STATE.get("fails") or {}).pop(p, None)
-                            _save_proxy_state(PROXY_STATE)
-                        return t.result()
+                        winner = (t, p)
+                        continue
                     _mark_proxy_fail(p, exc)
                     last_exc = exc
                     log.info(
                         "Прокси не ответчик (%s): %s",
                         (p or "?")[:30], str(exc).splitlines()[-1][:90],
                     )
+                if winner:
+                    t, p = winner
+                    if p and p != PROXY_STATE.get("current"):
+                        PROXY_STATE["current"] = p
+                        log.info("Рабочий прокси: %s", p[:40])
+                    if p:
+                        (PROXY_STATE.get("fails") or {}).pop(p, None)
+                        _save_proxy_state(PROXY_STATE)
+                    return t.result()
         finally:
             for t in tasks:
                 t.cancel()
@@ -477,6 +482,12 @@ async def _fill_yt_info(preview: Message, pend: dict[str, Any]) -> None:
     except Exception:
         pass
 
+def _needs_cookie_hint(url: str, err: Exception) -> bool:
+    if downloader.host_of(url) in downloader.COOKIE_HINT_HOSTS:
+        return True
+    low = str(err).lower()
+    return "not a bot" in low or "sign in to confirm" in low or "войдите" in low
+
 async def _slow_preview_flow(message: Message, url: str, user_id: int) -> None:
     status = await message.answer("🔍 Смотрю видео…")
     try:
@@ -484,8 +495,8 @@ async def _slow_preview_flow(message: Message, url: str, user_id: int) -> None:
     except yt_dlp.utils.DownloadError as exc:
         err = str(exc).splitlines()[-1][:350]
         msg = f"❌ Не удалось:\n{html.escape(err)}"
-        if downloader.host_of(url) in downloader.COOKIE_HINT_HOSTS:
-            msg += "\n\n💡 Вероятно нужен вход — положите cookies.txt рядом с ботом (см. README)."
+        if _needs_cookie_hint(url, exc):
+            msg += "\n\n💡 YouTube требует вход — положите cookies.txt рядом с ботом (см. README)."
         return await status.edit_text(msg)
     except Exception as exc:
         log.info("метаданные не получены: %s", exc)
@@ -718,8 +729,8 @@ async def cb_download(cb: CallbackQuery) -> None:
         log.exception("download failed: %s", exc)
         err = str(exc).splitlines()[-1][:300]
         text = f"❌ Ошибка:\n{html.escape(err)}"
-        if downloader.host_of(url) in downloader.COOKIE_HINT_HOSTS:
-            text += "\n\n💡 Попробуйте cookies.txt (см. README)."
+        if _needs_cookie_hint(url, exc):
+            text += "\n\n💡 YouTube требует вход — попробуйте cookies.txt (см. README)."
         await _edit_preview(cb.message, text)
     finally:
         ACTIVE.pop(chat_id, None)
