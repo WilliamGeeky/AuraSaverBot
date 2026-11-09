@@ -468,6 +468,16 @@ async def _handle_link_message(message: Message) -> None:
     _spawn(_fill_yt_info(preview, pend))
 
 async def _fill_yt_info(preview: Message, pend: dict[str, Any]) -> None:
+    async def pulse() -> None:
+        waited = 0
+        while not pend["done"].is_set() and not pend.get("locked"):
+            await asyncio.sleep(15)
+            waited += 15
+            if pend["done"].is_set() or pend.get("locked"):
+                return
+            await _edit_preview(preview, f"⏳ Ищу качество… {waited} с")
+
+    pt = asyncio.create_task(pulse())
     try:
         info: dict = await _get_media_info_rotating(pend["url"])
     except Exception as exc:
@@ -477,6 +487,8 @@ async def _fill_yt_info(preview: Message, pend: dict[str, Any]) -> None:
             err = html.escape(downloader.friendly_error(exc))
             await _edit_preview(preview, f"❌ Не удалось:\n{err}")
         return
+    finally:
+        pt.cancel()
     if info["live"] or info["no_media"]:
         pend["failed"] = True
         pend["done"].set()
@@ -486,7 +498,7 @@ async def _fill_yt_info(preview: Message, pend: dict[str, Any]) -> None:
             elif info.get("sabr"):
                 txt = (
                     "🔧 YouTube пока не отдаёт файлы этого видео (SABR). "
-                    "Попробуйте позже, ещё раз, или добавьте cookies/PO Token (см. README_RENDER)."
+                    "Попробуйте ещё раз или позже."
                 )
             else:
                 txt = "🤷 Видео по ссылке не найдено."
@@ -503,6 +515,7 @@ async def _fill_yt_info(preview: Message, pend: dict[str, Any]) -> None:
         )
     except Exception:
         pass
+
 
 def _needs_cookie_hint(url: str, err: Exception) -> bool:
     if downloader.host_of(url) in downloader.COOKIE_HINT_HOSTS:

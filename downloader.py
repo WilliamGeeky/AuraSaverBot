@@ -679,11 +679,12 @@ def _client_chains() -> list[list[str] | None]:
     if env:
         extra = [c for c in FALLBACK_CLIENTS if c not in env]
         return [env, env + extra, list(LIFELINE_CLIENTS)]
+    # Сначала клиенты, которые чаще всего отдают рабочие форматы с серверных IP.
+    # Никаких длинных цепочек — пользователь ждёт кнопки, а не экскурсию по YouTube API.
     return [
-        None,
+        list(LIFELINE_CLIENTS),  # android_vr, android, visionos — обычно хватает
         list(FALLBACK_CLIENTS),
-        list(LIFELINE_CLIENTS),
-        ["mweb", "web_safari", "web"],
+        None,
     ]
 
 
@@ -895,6 +896,10 @@ def get_media_info(url: str, proxy: str | None = None) -> dict:
             return _media_info_from_raw(info, url)
 
     # Второй шанс: обычная обработка yt-dlp (нужна части сайтов, не YouTube).
+    if yt:
+        if empty is not None:
+            return _media_info_from_raw(empty, url)
+        raise last_exc if last_exc else RuntimeError("Не удалось получить данные по ссылке.")
     try:
         opts = _base_opts()
         apply_cookies(opts, youtube=yt)
