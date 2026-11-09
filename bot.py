@@ -1,30 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-UX как у @TopSaverBot:
-
-1. /start — приветствие со списком поддерживаемых сайтов.
-2. Пользователь присылает ссылку -> бот показывает превью-картинку и кнопки:
-   [🎬 360p · 45 МБ][🎬 480p]
-   [🎬 720p][🎬 1080p]
-   [🎧 Audio]
-   (размер на кнопке — если сайт его отдал; YouTube отвечает мгновенно,
-   метаданные добираются фоном уже после показа обложки)
-3. При нажатии кнопки кнопки исчезают, и на том же сообщении после загрузки
-   приходит готовый файл с подписью TopSaverBot-стиля:
-   название · ссылка · качество · ❤️ @бот.
-   Живой прогресс не показываем специально: нажал кнопку -> сразу файл.
-
-Надёжность:
-- метаданные берутся гонкой прокси (несколько параллельно, побеждает первый);
-- память о рабочем/умершем прокси между перезапусками (proxystate.json);
-- общий лимит одновременных загрузок (MAX_CONCURRENT) — бот не захлёбывается;
-- файлы больше лимита Telegram отсекаются ДО отправки;
-- глобальный обработчик ошибок: бот не падает, пользователь получает ответ.
-
-Качество по умолчанию меняется кнопками после отправки ссылки; есть
-авто-понижение, если выбранный вариант больше лимита Telegram (49 МБ у
-стандартного API).
-"""
 from __future__ import annotations
 
 import asyncio
@@ -62,38 +35,36 @@ import downloader
 import yt_dlp
 
 try:
-    from aiohttp import web as aio_web  # для health-сервера (Render и подобные)
-except ImportError:  # pragma: no cover
+    from aiohttp import web as aio_web
+except ImportError:
     aio_web = None
 
 try:
     from aiogram.client.session.aiohttp import AiohttpSession
     from aiogram.client.telegram import TelegramAPIServer
-except ImportError:  # на случай старой версии aiogram
+except ImportError:
     AiohttpSession = None
     TelegramAPIServer = None
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 LOCAL_SERVER = (os.getenv("LOCAL_SERVER") or "no").lower() in ("1", "yes", "true", "on")
 API_BASE = (os.getenv("API_BASE") or "http://localhost:8081").strip().rstrip("/")
-BOT_PROXY = (os.getenv("BOT_PROXY") or "").strip()  # прокси для api.telegram.org (опция)
+BOT_PROXY = (os.getenv("BOT_PROXY") or "").strip()
 MAX_FILESIZE_MB = int(os.getenv("MAX_FILESIZE_MB") or (2000 if LOCAL_SERVER else 49))
 if not LOCAL_SERVER:
     MAX_FILESIZE_MB = min(MAX_FILESIZE_MB, 49)
 MAX_FILESIZE = MAX_FILESIZE_MB * 1024 * 1024
 KEEP_FILES = (os.getenv("KEEP_FILES") or "no").lower() in ("1", "yes", "true", "on")
-MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT") or 3))  # одновременных загрузок всего
+MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT") or 3))
 YTDLP_AUTOUPDATE = (os.getenv("YTDLP_AUTOUPDATE") or "yes").lower() in ("1", "yes", "true", "on")
 BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").strip() or "AuraMoggSaverBot"
-# Порт health-сервера (Render/HF ставят PORT сами; на ПК пусто — сервер не нужен)
 HEALTH_PORT = int(os.getenv("HEALTH_PORT") or os.getenv("PORT") or 0)
 
-# Память о рабочем прокси между перезапусками
 PROXY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxystate.json")
 
-SEND_TIMEOUT = 36_000  # сек — на выгрузку больших файлов
-METADATA_BATCH = 3  # сколько прокси гоняем параллельно за раз
-METADATA_RACE_TIMEOUT = 40  # сек — сколько ждём батч прокси
+SEND_TIMEOUT = 36_000
+METADATA_BATCH = 3
+METADATA_RACE_TIMEOUT = 40
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,20 +76,15 @@ dp = Dispatcher()
 
 bot: Bot | None = None
 
-# Незавершённые ожидания кнопок: message_id(строка) -> {url, user_id, info}
 PENDING: dict[str, dict[str, Any]] = {}
-# Активные загрузки: chat_id -> {"reporter": Reporter, "kind": "video"|"audio"}
 ACTIVE: dict[int, dict[str, Any]] = {}
-# Ссылки на фоновые задачи — без этого GC может убить задачу посреди работы
 TASKS: set[asyncio.Task] = set()
-# Общий лимит одновременных загрузок (все чаты) — защита от перегрузки
 DL_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
 
 HEXT_RE_SIMPLE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 HEXT_RE = re.compile(
     r"(?:^|\s)((?:www\.|m\.)?(?:[\w-]+\.)+[a-z]{2,}/[^\s<>\"']+)", re.IGNORECASE
 )
-
 
 def human_size(n: float | None) -> str:
     if n is None:
@@ -130,14 +96,11 @@ def human_size(n: float | None) -> str:
         value /= 1024
     return "?"
 
-
 def _clip(s: str, n: int) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[: n - 1] + "…"
 
-
 def extract_urls(text: str) -> list[str]:
-    """Достаёт ссылки из сообщения, дополняя схему при необходимости."""
     found = [m.group(0) for m in HEXT_RE_SIMPLE.finditer(text)]
     if found:
         return found
@@ -145,34 +108,24 @@ def extract_urls(text: str) -> list[str]:
         found.append("https://" + m.group(1).strip())
     return found
 
-
 QUALITY_LABELS: dict[int, str] = {360: "360p", 480: "480p", 720: "720p", 1080: "1080p"}
 
 YT_ID_RE = re.compile(
     r"(?:watch\?v=|youtu\.be/|/shorts/|/live/|/embed/)([A-Za-z0-9_-]{11})", re.IGNORECASE
 )
 
-
 async def _ack(cb: CallbackQuery, text: str | None = None, alert: bool = False) -> None:
-    """Подтверждает кнопку (гасит спиннер), не падая на повторных ответах."""
     try:
         await cb.answer(text, show_alert=alert)
     except Exception:
         pass
 
-
 def _spawn(coro: Any) -> None:
-    """create_task с сохранением ссылки — иначе задача может быть собрана GC."""
     t = asyncio.create_task(coro)
     TASKS.add(t)
     t.add_done_callback(TASKS.discard)
 
-
 async def _edit_preview(msg: Message, text: str, kb: InlineKeyboardMarkup | None = None) -> None:
-    """Правит превью-сообщение: работает и для фото (caption), и для текста.
-
-    kb=None снимает кнопки. Ошибки Telegram глотаем — не важнее основного потока.
-    """
     try:
         if msg.photo or msg.video:
             await msg.edit_caption(caption=text, reply_markup=kb)
@@ -180,11 +133,8 @@ async def _edit_preview(msg: Message, text: str, kb: InlineKeyboardMarkup | None
             await msg.edit_text(text=text, reply_markup=kb)
     except TelegramBadRequest:
         pass
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.debug("edit_preview failed", exc_info=True)
-
-
-# --- Ротация прокси ---------------------------------------------------------
 
 def _load_proxy_state() -> dict:
     try:
@@ -193,7 +143,6 @@ def _load_proxy_state() -> dict:
     except Exception:
         return {}
 
-
 def _save_proxy_state(state: dict) -> None:
     try:
         with open(PROXY_FILE, "w", encoding="utf-8") as f:
@@ -201,12 +150,9 @@ def _save_proxy_state(state: dict) -> None:
     except Exception:
         pass
 
-
 PROXY_STATE: dict = _load_proxy_state()
 
-
 def _mark_proxy_fail(p: str | None, exc: Exception) -> None:
-    """Запоминаем время неудачи прокси — недавно упавшие уходят в конец очереди."""
     if not p:
         return
     fails = PROXY_STATE.setdefault("fails", {})
@@ -216,7 +162,6 @@ def _mark_proxy_fail(p: str | None, exc: Exception) -> None:
         fails.pop(k, None)
     _save_proxy_state(PROXY_STATE)
 
-
 def current_proxy() -> str | None:
     pool = downloader.proxy_pool()
     if not pool:
@@ -224,9 +169,7 @@ def current_proxy() -> str | None:
     cur = PROXY_STATE.get("current")
     return cur if cur in pool else pool[0]
 
-
 def _proxy_candidates() -> list[str | None]:
-    """Порядок попыток: рабочий, затем свежие, затем недавно упавшие."""
     pool = downloader.proxy_pool()
     if not pool:
         return [None]
@@ -241,19 +184,12 @@ def _proxy_candidates() -> list[str | None]:
 
     return sorted(pool, key=key)
 
-
 def _set_proxy(p: str) -> None:
     PROXY_STATE["current"] = p
     _save_proxy_state(PROXY_STATE)
     log.info("Рабочий прокси: %s", p[:40])
 
-
 async def _get_media_info_rotating(url: str) -> dict:
-    """Метаданные: гоняем несколько прокси параллельно — побеждает первый ответивший.
-
-    Мёртвый прокси больше не тормозит весь запрос на 30 с: батчи по
-    METADATA_BATCH штук, между батчами — если все молчат.
-    """
     candidates = _proxy_candidates()
     last_exc: Exception | None = None
     for i in range(0, len(candidates), METADATA_BATCH):
@@ -268,7 +204,7 @@ async def _get_media_info_rotating(url: str) -> dict:
                     set(tasks), timeout=METADATA_RACE_TIMEOUT,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if not done:  # весь батч висит — снимаем и пробуем следующий
+                if not done:
                     last_exc = TimeoutError(f"прокси не ответили за {METADATA_RACE_TIMEOUT} с")
                     log.info("Батч прокси молчит %d с — пробую следующий", METADATA_RACE_TIMEOUT)
                     break
@@ -290,13 +226,11 @@ async def _get_media_info_rotating(url: str) -> dict:
                         (p or "?")[:30], str(exc).splitlines()[-1][:90],
                     )
         finally:
-            for t in tasks:  # не дождались — снимаем (потоки доработают в фоне и умрут)
+            for t in tasks:
                 t.cancel()
     raise last_exc if last_exc else RuntimeError("Нет доступных прокси")
 
-
 class Reporter:
-    """Прогресс-коллбэк для yt-dlp: сам текст нигде не показываем, только флаг отмены."""
 
     def __init__(
         self,
@@ -313,16 +247,14 @@ class Reporter:
         self._loop = loop
         self._cancel = asyncio.Event()
 
-    # --- вызывается из потока yt-dlp ---
     def cancelled(self) -> bool:
         return self._cancel.is_set()
 
     def update(self, d: dict) -> None:
-        pass  # прогресс в чат не выводим — по просьбе: нажал кнопку → сразу файл
+        pass
 
     def request_cancel(self) -> None:
         self._cancel.set()
-
 
 def build_bot() -> Bot:
     defaults = DefaultBotProperties(
@@ -333,19 +265,16 @@ def build_bot() -> Bot:
         session = AiohttpSession(api=TelegramAPIServer.from_base(API_BASE))
         return Bot(token=BOT_TOKEN, session=session, default=defaults)
     if BOT_PROXY and AiohttpSession is not None:
-        # python_socks не понимает socks5h:// — приводим к socks5://
         proxy = re.sub(r"^socks5h://", "socks5://", BOT_PROXY)
         session = AiohttpSession(proxy=proxy)
         return Bot(token=BOT_TOKEN, session=session, default=defaults)
     return Bot(token=BOT_TOKEN, default=defaults)
 
-
 def build_keyboard(msg_id: int, info: dict, user_id: int) -> InlineKeyboardMarkup:
-    """Кнопки как у TopSaverBot: 2×2 качества + Audio. Размер — если сайт его отдал."""
     variants = info.get("variants") or {}
     heights = [h for h in (360, 480, 720, 1080) if variants.get(h, (None, ""))[0]]
     if not heights:
-        heights = [360, 480, 720, 1080]  # метаданные ещё грузятся — показываем как обычно
+        heights = [360, 480, 720, 1080]
 
     def label(h: int) -> str:
         est = variants.get(h, (None, ""))[0]
@@ -363,7 +292,6 @@ def build_keyboard(msg_id: int, info: dict, user_id: int) -> InlineKeyboardMarku
     rows.append([InlineKeyboardButton(text="🎧 Audio", callback_data=f"dl:a:{msg_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 WELCOME_TEXT = (
     "🔥 <b>Привет! Я AuraSaver</b> — скачиваю видео и аудио с популярных сайтов.\n\n"
     "📲 <b>Как пользоваться:</b>\n"
@@ -375,16 +303,13 @@ WELCOME_TEXT = (
     "💡 Просто пришли ссылку — остальное я сделаю сам."
 )
 
-
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(WELCOME_TEXT)
 
-
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(WELCOME_TEXT)
-
 
 @dp.message(Command("q"))
 async def cmd_quality(message: Message) -> None:
@@ -395,7 +320,6 @@ async def cmd_quality(message: Message) -> None:
         "Кнопки появляются под превью видео."
     )
 
-
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message) -> None:
     st = ACTIVE.get(message.chat.id)
@@ -404,7 +328,6 @@ async def cmd_cancel(message: Message) -> None:
         await message.answer("🛑 Отменяю текущую загрузку…")
         return
     await message.answer("Сейчас ничего не качается 🙂")
-
 
 def _preview_caption(info: dict, url: str, with_hint: bool = True) -> str:
     title = html.escape(_clip(info.get("title") or "Видео", 180))
@@ -415,19 +338,13 @@ def _preview_caption(info: dict, url: str, with_hint: bool = True) -> str:
         lines.append("Выбери качество (или 🎧 Audio):")
     return "\n".join(lines)
 
-
 def _remember_pending(msg_id: int, pend: dict[str, Any]) -> None:
-    # Память на ожидание кнопки: если накопилось — выкидываем старые
     if len(PENDING) > 60:
         for k in list(PENDING)[:30]:
             PENDING.pop(k, None)
     PENDING[str(msg_id)] = pend
 
-
 async def _show_preview(message: Message, url: str, info: dict, user_id: int) -> None:
-    """Превью-картинка видео + кнопки качества (как у TopSaverBot)."""
-    # msg_id=0: реальный id cb_download подставляет сам при клике —
-    # лишний API-запрос edit_reply_markup не нужен, превью появляется быстрее.
     kb = build_keyboard(0, info, user_id)
     caption = _preview_caption(info, url)
     fallback_caption = _preview_caption(info, url, with_hint=False) + "\n\n<i>обложка не получилась — но видео скачается в полном порядке</i>"
@@ -458,14 +375,12 @@ async def _show_preview(message: Message, url: str, info: dict, user_id: int) ->
 
     _remember_pending(preview.message_id, {"url": url, "user_id": user_id, "info": info})
 
-
 @dp.message(F.text | F.caption)
 async def on_message(message: Message) -> None:
     try:
         await _handle_link_message(message)
-    except Exception:  # noqa: BLE001 — ничего неожиданное не должно валить бота
+    except Exception:
         log.exception("ошибка обработки сообщения")
-
 
 async def _handle_link_message(message: Message) -> None:
     text = (message.text or message.caption or "").strip()
@@ -473,7 +388,7 @@ async def _handle_link_message(message: Message) -> None:
         return
     urls = extract_urls(text)
     if not urls:
-        return  # обычный текст — молчим (как TopSaverBot)
+        return
     allowed = [u for u in urls if downloader.is_allowed(u)]
     if not allowed:
         return await message.answer(
@@ -491,7 +406,6 @@ async def _handle_link_message(message: Message) -> None:
         await _slow_preview_flow(message, url, user_id)
         return
 
-    # YouTube: мгновенная обложка + название (без "Смотрю видео…"), метаданные — фоном
     cover, quick_title = await asyncio.to_thread(
         downloader.youtube_quick, m.group(1), current_proxy()
     )
@@ -530,12 +444,10 @@ async def _handle_link_message(message: Message) -> None:
     _remember_pending(preview.message_id, pend)
     _spawn(_fill_yt_info(preview, pend))
 
-
 async def _fill_yt_info(preview: Message, pend: dict[str, Any]) -> None:
-    """Фоном добирает метаданные и заменяет название/кнопки под уже показанной обложкой."""
     try:
         info: dict = await _get_media_info_rotating(pend["url"])
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         pend["failed"] = True
         pend["done"].set()
         if not pend["locked"]:
@@ -562,12 +474,10 @@ async def _fill_yt_info(preview: Message, pend: dict[str, Any]) -> None:
             caption=_preview_caption(info, pend["url"]),
             reply_markup=build_keyboard(0, info, pend["user_id"]),
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
-
 async def _slow_preview_flow(message: Message, url: str, user_id: int) -> None:
-    """Сайты кроме YouTube: сначала метаданные, потом превью (обложки по ID нет)."""
     status = await message.answer("🔍 Смотрю видео…")
     try:
         info: dict = await _get_media_info_rotating(url)
@@ -577,7 +487,7 @@ async def _slow_preview_flow(message: Message, url: str, user_id: int) -> None:
         if downloader.host_of(url) in downloader.COOKIE_HINT_HOSTS:
             msg += "\n\n💡 Вероятно нужен вход — положите cookies.txt рядом с ботом (см. README)."
         return await status.edit_text(msg)
-    except Exception as exc:  # noqa: BLE001 — таймауты гонки прокси и прочее
+    except Exception as exc:
         log.info("метаданные не получены: %s", exc)
         return await status.edit_text(
             "❌ Не удалось получить данные по ссылке. Попробуйте ещё раз —\n"
@@ -587,7 +497,6 @@ async def _slow_preview_flow(message: Message, url: str, user_id: int) -> None:
     if info["live"]:
         return await status.edit_text("📺 Это прямая трансляция — эфиры записывать не умею.")
 
-    # Ссылка без видео, но с картинкой (Pinterest/Instagram/X посты) — сразу фото
     if info["no_media"] and info.get("images"):
         img_file = await asyncio.to_thread(downloader.fetch_best_image, info, current_proxy())
         if img_file:
@@ -603,7 +512,7 @@ async def _slow_preview_flow(message: Message, url: str, user_id: int) -> None:
                     pass
             try:
                 await status.delete()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             return
 
@@ -613,9 +522,8 @@ async def _slow_preview_flow(message: Message, url: str, user_id: int) -> None:
     await _show_preview(message, url, info, user_id)
     try:
         await status.delete()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
-
 
 def result_caption(
     title: str, link: str, quality: str, downgraded: bool, audio: bool = False
@@ -631,7 +539,6 @@ def result_caption(
         f"❤️ <a href=\"https://t.me/{BOT_USERNAME}\">@{BOT_USERNAME}</a>"
     )
 
-
 def _run_download(
     audio_mode: bool, url: str, height: int, temp_path: str, reporter: Reporter, proxy: str | None
 ) -> tuple[str, dict]:
@@ -639,21 +546,16 @@ def _run_download(
         return downloader.download_audio(url, temp_path, reporter, proxy)
     return downloader.download(url, height, temp_path, reporter, proxy)
 
-
 def _dl_error_is_rotatable(err: Exception) -> bool:
     low = str(err).lower()
     return any(k in low for k in (
         "not a bot", "proxy", "timed out", "timeout", "connection", "socket", "unavailable", "eof",
     ))
 
-
 class _FileTooBig(Exception):
-    """Файл скачался, но в Telegram его отправить нельзя — лимит."""
     pass
 
-
 async def _send_media(send: Any, **kwargs: Any) -> None:
-    """Отправка файла; при флуд-контроле ждём retry_after и пробуем ещё раз."""
     try:
         await send(request_timeout=SEND_TIMEOUT, **kwargs)
     except TelegramRetryAfter as exc:
@@ -664,7 +566,6 @@ async def _send_media(send: Any, **kwargs: Any) -> None:
         await asyncio.sleep(wait_s)
         await send(request_timeout=SEND_TIMEOUT, **kwargs)
 
-
 @dp.callback_query(F.data.startswith("dl:"))
 async def cb_download(cb: CallbackQuery) -> None:
     if not cb.message or not bot:
@@ -672,7 +573,7 @@ async def cb_download(cb: CallbackQuery) -> None:
     parts = (cb.data or "").split(":")
     kind = parts[1] if len(parts) > 1 else ""
     mid = parts[-1]
-    if mid == "0":  # мгновенное превью: кнопка создана до того, как мы узнали message_id
+    if mid == "0":
         mid = str(cb.message.message_id)
     st = PENDING.get(mid)
     if not st:
@@ -680,7 +581,6 @@ async def cb_download(cb: CallbackQuery) -> None:
     if st.get("user_id") and cb.from_user.id != st["user_id"]:
         return await _ack(cb, "Это чужой запрос — пришли себе такую же ссылку 🙂", alert=True)
 
-    # Микропревью опередило метаданные — коротко ждём их
     if st.get("info") is None:
         await _ack(cb, "⏳ Секунду, добираю данные…")
         try:
@@ -698,10 +598,9 @@ async def cb_download(cb: CallbackQuery) -> None:
         return await _ack(cb, "⏳ Уже качаю предыдущий файл — /cancel чтобы прервать.", alert=True)
 
     pending = PENDING.pop(mid, None)
-    if not pending:  # пока ждали, клик успел обработать другой апдейт
+    if not pending:
         return await _ack(cb, "Уже обрабатываю этот запрос 🙂", alert=True)
     pending["locked"] = True
-    # Занимаем чат ДО первого await — двойной клик не запустит две загрузки
     ACTIVE[chat_id] = {"reporter": None, "kind": "pending"}
     await _ack(cb)
     url: str = pending["url"]
@@ -732,7 +631,6 @@ async def cb_download(cb: CallbackQuery) -> None:
 
     height_label = QUALITY_LABELS.get(height or 0, f"{height}p" if height else "видео")
 
-    # Кнопки тихо убираем — подпись (обложка + название) остаётся нетронутой
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
     except TelegramBadRequest:
@@ -748,7 +646,7 @@ async def cb_download(cb: CallbackQuery) -> None:
 
     filepath: str | None = None
     try:
-        async with DL_SEMAPHORE:  # общий лимит нагрузки на машину/сеть
+        async with DL_SEMAPHORE:
             try:
                 filepath, dinfo = await asyncio.to_thread(
                     _run_download, audio_mode, url, height, temp_path, reporter, current_proxy()
@@ -768,7 +666,6 @@ async def cb_download(cb: CallbackQuery) -> None:
                 else:
                     raise
 
-            # Файл больше лимита? Отсекаем ДО отправки — иначе часы видимого «зависания»
             size = os.path.getsize(filepath)
             if size > MAX_FILESIZE:
                 raise _FileTooBig()
@@ -796,8 +693,8 @@ async def cb_download(cb: CallbackQuery) -> None:
                     thumbnail=FSInputFile(thumb) if thumb else None,
                 )
         try:
-            await cb.message.delete()  # превью больше не нужно
-        except Exception:  # noqa: BLE001
+            await cb.message.delete()
+        except Exception:
             pass
     except yt_dlp.utils.DownloadCancelled:
         await _edit_preview(cb.message, "❌ Отменено.")
@@ -817,7 +714,7 @@ async def cb_download(cb: CallbackQuery) -> None:
             )
         else:
             await _edit_preview(cb.message, f"❌ Telegram: {html.escape(str(exc))[:250]}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.exception("download failed: %s", exc)
         err = str(exc).splitlines()[-1][:300]
         text = f"❌ Ошибка:\n{html.escape(err)}"
@@ -829,10 +726,8 @@ async def cb_download(cb: CallbackQuery) -> None:
         if not KEEP_FILES and os.path.isdir(temp_path):
             shutil.rmtree(temp_path, ignore_errors=True)
 
-
 @dp.errors()
 async def on_unexpected_error(event: ErrorEvent) -> bool:
-    """Последний рубеж: любая ошибка логируется, бот продолжает работать."""
     log.error("Необработанная ошибка апдейта: %s", event.exception, exc_info=event.exception)
     try:
         update = event.update
@@ -841,17 +736,11 @@ async def on_unexpected_error(event: ErrorEvent) -> bool:
         )
         if msg is not None and bot:
             await _edit_preview(msg, "😢 Внутренняя ошибка — пришли ссылку ещё раз.")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return True
 
-
 async def _health_server() -> None:
-    """Мини-HTTP на :PORT для платформ вроде Render: / и /ping отвечают ok.
-
-    Платформы пингуют этот порт, считают сервис «живым» и не усыпляют его,
-    а внешний будильник (cron-job.org/UptimeRobot) не даёт Render заснуть.
-    """
     if aio_web is None or not HEALTH_PORT:
         return
     started = time.time()
@@ -870,13 +759,12 @@ async def _health_server() -> None:
     await runner.setup()
     await aio_web.TCPSite(runner, "0.0.0.0", HEALTH_PORT).start()
     log.info("Health-сервер слушает порт %d", HEALTH_PORT)
-    await asyncio.Event().wait()  # живём, пока жив процесс
-
+    await asyncio.Event().wait()
 
 async def main() -> None:
     global bot, BOT_USERNAME
     if not KEEP_FILES:
-        downloader.cleanup_downloads()  # хлам от прошлых запусков (обрывы/падения)
+        downloader.cleanup_downloads()
     if YTDLP_AUTOUPDATE:
         threading.Thread(
             target=downloader.maybe_autoupdate_ytdlp, daemon=True, name="ytdlp-update"
@@ -884,7 +772,7 @@ async def main() -> None:
     bot = build_bot()
     try:
         me = await bot.get_me()
-    except Exception as exc:  # noqa: BLE001 — сеть/BOT_PROXY недоступны
+    except Exception as exc:
         log.error("Не могу связаться с Telegram: %s", str(exc).splitlines()[-1][:200])
         log.error(
             "Проверьте интернет и BOT_PROXY в .env (публичные прокси умирают — "
@@ -893,7 +781,7 @@ async def main() -> None:
         )
         try:
             await bot.session.close()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         sys.exit(1)
     if os.getenv("BOT_USERNAME", "").strip():
@@ -911,7 +799,6 @@ async def main() -> None:
     if LOCAL_SERVER:
         log.info("API_BASE: %s", API_BASE)
 
-    # Меню команд и профиль бота — современный вид без ручной возни в BotFather
     try:
         await bot.set_my_commands([
             BotCommand(command="start", description="🚀 Запустить бота"),
@@ -928,13 +815,12 @@ async def main() -> None:
             "Скачивает видео и аудио с YouTube, TikTok, Instagram и других сайтов по ссылке"
         )
         log.info("Меню команд и описание бота обновлены")
-    except Exception as exc:  # noqa: BLE001 — не критично, попробуем в следующий старт
+    except Exception as exc:
         log.info("Не удалось обновить профиль бота: %s", str(exc).splitlines()[-1][:120])
 
     if HEALTH_PORT and aio_web is not None:
         _spawn(_health_server())
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     if not BOT_TOKEN:

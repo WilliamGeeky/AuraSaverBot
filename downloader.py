@@ -1,8 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Скачивание видео через yt-dlp: анализ ссылки, выбор оптимальных дорожек
-(макс. качество в пределах выбранного разрешения, минимум лишнего трафика).
-"""
 from __future__ import annotations
 
 import json
@@ -24,13 +19,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
 UPDATE_STATE_FILE = os.path.join(BASE_DIR, "ytdlp_update.json")
 
-# Имя файла без сюрпризов: длинные названия обрезаем до 100 символов,
-# иначе на Windows упрёмся в лимит пути (260) и скачивание упадёт.
 OUTTMPL = "%(title).100B [%(id)s].%(ext)s"
 
 QUALITIES = (360, 480, 720, 1080)
 
-# --- Блокировка 18+ сайтов -------------------------------------------------
 BANNED_SUBSTRINGS = (
     "porn", "xxx", "nsfw", "sex", "adult", "onlyfans", "fansly",
     "stripchat", "chaturbate", "bongacams", "livejasmin", "camsoda",
@@ -40,15 +32,12 @@ BANNED_SUBSTRINGS = (
     "gelbooru", "e621", "fapello", "coomer", "kemono",
 )
 
-# Сайты, где чаще всего нужны cookies (приватные/закрытые посты)
 COOKIE_HINT_HOSTS = {
     "instagram.com", "instagr.am", "twitter.com", "x.com",
     "facebook.com", "fb.watch",
 }
 
-
 def _find_ffmpeg() -> str | None:
-    """Путь к ffmpeg: переменная окружения → PATH → стандартное место winget."""
     env = (os.environ.get("FFMPEG_LOCATION") or "").strip()
     if env:
         return env
@@ -60,18 +49,13 @@ def _find_ffmpeg() -> str | None:
     )
     return cand if os.path.isfile(cand) else None
 
-
 def ffmpeg_available() -> bool:
-    """Есть ли ffmpeg — нужен для склейки видео+аудио в 1080p/720p."""
     return _find_ffmpeg() is not None
-
 
 def _host(url: str) -> str:
     return urlparse(url).netloc.lower().removeprefix("www.")
 
-
 def is_allowed(url: str) -> bool:
-    """True, если домен не из списка 18+."""
     try:
         host = urlparse(url).netloc.lower()
     except ValueError:
@@ -80,15 +64,12 @@ def is_allowed(url: str) -> bool:
         return False
     return not any(bad in host for bad in BANNED_SUBSTRINGS)
 
-
 def host_of(url: str) -> str:
     return _host(url)
-
 
 def _cookie_hint_needed(host: str) -> bool:
     has_cookies = bool(_resolve_cookies_file()) or bool(os.environ.get("COOKIES_FROM_BROWSER"))
     return host in COOKIE_HINT_HOSTS and not has_cookies
-
 
 def _resolve_cookies_file() -> str | None:
     name = (os.environ.get("COOKIES_FILE") or "").strip()
@@ -96,7 +77,6 @@ def _resolve_cookies_file() -> str | None:
         return None
     path = name if os.path.isabs(name) else os.path.join(BASE_DIR, name)
     return path if os.path.isfile(path) else None
-
 
 def apply_cookies(opts: dict[str, Any]) -> None:
     cf = _resolve_cookies_file()
@@ -109,9 +89,7 @@ def apply_cookies(opts: dict[str, Any]) -> None:
     if proxy:
         opts["proxy"] = proxy
 
-
 def proxy_pool() -> list[str]:
-    """PROXY + запасные прокси из .env (PROXY_BACKUPS, через запятую)."""
     pool: list[str] = []
     current = (os.environ.get("PROXY") or "").strip()
     if current:
@@ -122,18 +100,12 @@ def proxy_pool() -> list[str]:
             pool.append(p)
     return pool
 
-
 def temp_dir(tag: str) -> str:
     path = os.path.join(DOWNLOADS_DIR, tag)
     os.makedirs(path, exist_ok=True)
     return path
 
-
 def cleanup_downloads() -> None:
-    """Убирает мусор от прошлых запусков: обрывы и падения оставляют папки на гигабайты.
-
-    Вызывать только на старте бота, пока активных загрузок нет.
-    """
     try:
         if not os.path.isdir(DOWNLOADS_DIR):
             return
@@ -149,14 +121,7 @@ def cleanup_downloads() -> None:
     except Exception:
         pass
 
-
 def maybe_autoupdate_ytdlp() -> None:
-    """Раз в сутки тихо обновляет yt-dlp в фоне (не блокирует запуск бота).
-
-    Extractor'ы сайтов ломаются постоянно — свежий yt-dlp это главный аргумент
-    «бот не падает». Новая версия подхватится при следующем перезапуске
-    (start_bot.bat перезапускает процесс сам).
-    """
     enabled = (os.environ.get("YTDLP_AUTOUPDATE") or "yes").lower() in ("1", "yes", "true", "on")
     if not enabled:
         return
@@ -197,11 +162,9 @@ def maybe_autoupdate_ytdlp() -> None:
             log = logging.getLogger("downloader")
             log.info("yt-dlp обновлён %s -> %s (вступит в силу после перезапуска бота)", before, after)
     except Exception:
-        pass  # сеть может быть недоступна — не страшно, попробуем завтра
-
+        pass
 
 def make_screenshot(video_path: str, out_dir: str) -> str | None:
-    """Кадр ~на 5-й секунде видео, сжатый до 320px — превью в Telegram (<90 КБ)."""
     ffmpeg = _find_ffmpeg()
     if not ffmpeg or not os.path.isfile(video_path):
         return None
@@ -222,13 +185,7 @@ def make_screenshot(video_path: str, out_dir: str) -> str | None:
             return None
     return None
 
-
 def fetch_best_image(info: dict, proxy: str | None = None) -> str | None:
-    """
-    Скачивает самую крупную картинку из поста (Pinterest/Instagram/X и т.п.)
-    и приводит её к JPEG/PNG для sendPhoto. Возвращает путь; файл удаляет вызвавший.
-    proxy — рабочий прокси от ротации бота; иначе PROXY из .env.
-    """
     import requests
 
     proxy = proxy or (os.environ.get("PROXY") or "").strip() or None
@@ -249,18 +206,17 @@ def fetch_best_image(info: dict, proxy: str | None = None) -> str | None:
         except Exception:
             continue
 
-        if data[:2] == b"\xff\xd8":  # JPEG как есть
+        if data[:2] == b"\xff\xd8":
             path = os.path.join(tmp, f"i_{tag}.jpg")
             with open(path, "wb") as f:
                 f.write(data)
             return path
-        if data[:4] == b"\x89PNG":  # PNG как есть
+        if data[:4] == b"\x89PNG":
             path = os.path.join(tmp, f"i_{tag}.png")
             with open(path, "wb") as f:
                 f.write(data)
             return path
 
-        # webp/avif → конвертация в JPEG
         ffmpeg = _find_ffmpeg()
         if ffmpeg:
             raw = os.path.join(tmp, f"i_{tag}.raw")
@@ -283,14 +239,7 @@ def fetch_best_image(info: dict, proxy: str | None = None) -> str | None:
                     pass
     return None
 
-
 def youtube_quick(video_id: str, proxy: str | None = None) -> tuple[str | None, str]:
-    """
-    Мгновенные данные YouTube без полного парсинга:
-    обложка hqdefault.jpg + название через oEmbed. Возвращает (путь_к_обложке, название).
-    Оба запроса идут параллельно — превью появляется вдвое быстрее.
-    proxy — рабочий прокси от ротации бота; иначе PROXY из .env.
-    """
     import requests
     from concurrent.futures import ThreadPoolExecutor
 
@@ -308,7 +257,7 @@ def youtube_quick(video_id: str, proxy: str | None = None) -> tuple[str | None, 
             )
             if r.status_code == 200 and len(r.content) >= 1024:
                 data = r.content
-                if data[:2] == b"\xff\xd8":  # JPEG как есть
+                if data[:2] == b"\xff\xd8":
                     cover = os.path.join(tmp, f"t_{tag}.jpg")
                     with open(cover, "wb") as f:
                         f.write(data)
@@ -354,14 +303,7 @@ def youtube_quick(video_id: str, proxy: str | None = None) -> tuple[str | None, 
         title = ex.submit(grab_title).result()
     return cover, title
 
-
 def fetch_thumbnail(info: dict, proxy: str | None = None) -> str | None:
-    """
-    Скачивает обложку видео (иногда через прокси — YouTube у части сетей закрыт)
-    и приводит её к JPEG/PNG, которые принимает sendPhoto (webp — конвертация ffmpeg).
-    Возвращает путь к файлу или None. Файл должен удалить вызвавший код.
-    proxy — рабочий прокси от ротации бота; иначе PROXY из .env.
-    """
     import requests
 
     cands: list[str] = []
@@ -389,18 +331,17 @@ def fetch_thumbnail(info: dict, proxy: str | None = None) -> str | None:
         except Exception:
             continue
 
-        if data[:2] == b"\xff\xd8":  # JPEG — принимает Telegram как есть
+        if data[:2] == b"\xff\xd8":
             path = os.path.join(tmp, f"t_{tag}.jpg")
             with open(path, "wb") as f:
                 f.write(data)
             return path
-        if data[:4] == b"\x89PNG":  # PNG тоже допустим
+        if data[:4] == b"\x89PNG":
             path = os.path.join(tmp, f"t_{tag}.png")
             with open(path, "wb") as f:
                 f.write(data)
             return path
 
-        # webp/avif и прочее → конвертируем в JPEG
         ffmpeg = _find_ffmpeg()
         if ffmpeg:
             raw = os.path.join(tmp, f"t_{tag}.raw")
@@ -424,11 +365,7 @@ def fetch_thumbnail(info: dict, proxy: str | None = None) -> str | None:
                 return out
     return None
 
-
-# --- Выбор форматов --------------------------------------------------------
-
 def _codec_pref_video(f: dict) -> int:
-    """Предпочитаем H.264/AVC — играет в Telegram без перекодирования."""
     c = (f.get("vcodec") or "").lower()
     if c.startswith(("avc1", "h264")):
         return 4
@@ -440,13 +377,11 @@ def _codec_pref_video(f: dict) -> int:
         return 1
     return 0
 
-
 def _codec_pref_audio(f: dict) -> int:
     c = (f.get("acodec") or "").lower()
     if c.startswith("mp4a") or f.get("ext") == "m4a":
-        return 2  # AAC — совместим с mp4-контейнером
+        return 2
     return 1
-
 
 def _size_of(f: dict, duration: float | None) -> int | None:
     size = f.get("filesize") or f.get("filesize_approx")
@@ -456,18 +391,14 @@ def _size_of(f: dict, duration: float | None) -> int | None:
             size = int(br * 1000 * duration / 8)
     return int(size) if size else None
 
-
 def _is_video_only(f: dict) -> bool:
     return f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
-
 
 def _is_audio_only(f: dict) -> bool:
     return f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
 
-
 def _is_progressive(f: dict) -> bool:
     return f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
-
 
 def _best_video(fmts: list[dict], max_height: int) -> dict | None:
     vids = [
@@ -484,7 +415,6 @@ def _best_video(fmts: list[dict], max_height: int) -> dict | None:
         key=lambda f: (_codec_pref_video(f), int(f["height"]), float(f.get("tbr") or 0)),
     )
 
-
 def _best_audio(fmts: list[dict]) -> dict | None:
     auds = [f for f in fmts if _is_audio_only(f)]
     if not auds:
@@ -494,9 +424,7 @@ def _best_audio(fmts: list[dict]) -> dict | None:
         key=lambda f: (_codec_pref_audio(f), float(f.get("abr") or 0), float(f.get("tbr") or 0)),
     )
 
-
 def estimate_variant(fmts: list[dict], max_height: int, duration: float | None) -> tuple[int | None, str]:
-    """Оценка размера (байты) для варианта разрешения max_height."""
     prog = [
         f for f in fmts
         if _is_progressive(f)
@@ -523,21 +451,16 @@ def estimate_variant(fmts: list[dict], max_height: int, duration: float | None) 
         return None, ""
     return v_size + a_size, f"{v.get('ext', 'mp4')} + {a.get('ext', 'm4a')} {int(v['height'])}p"
 
-
 def build_format_expr(max_height: int) -> str:
-    """Формат: лучшее видео <=max_height + лучший звук. Без перекодирования."""
     if ffmpeg_available():
         return (
             f"bv*[vcodec^=avc1][height<={max_height}]+ba[acodec^=mp4a]/"
             f"bv*[vcodec^=avc1]+ba/bv*[height<={max_height}]+ba/"
             f"b[height<={max_height}][ext=mp4]/b[height<={max_height}]/b"
         )
-    # без ffmpeg — только готовые (прогрессивные) дорожки
     return f"b[ext=mp4][height<={max_height}]/b[height<={max_height}]/b"
 
-
 def _unwrap_playlist(info: dict) -> dict:
-    """Если извлеклась подборка — берём первое видео."""
     if info.get("_type") in ("playlist", "multi_video"):
         entries = [e for e in (info.get("entries") or []) if e]
         if not entries:
@@ -545,11 +468,7 @@ def _unwrap_playlist(info: dict) -> dict:
         return dict(entries[0])
     return info
 
-
-# --- Публичное API ---------------------------------------------------------
-
 def get_media_info(url: str, proxy: str | None = None) -> dict:
-    """Запрашивает только метаданные (без скачивания). Возвращает инфо + оценку размеров."""
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -575,7 +494,6 @@ def get_media_info(url: str, proxy: str | None = None) -> dict:
 
     host = host_of(info.get("webpage_url") or url)
 
-    # Форматы-картинки (Pinterest/Instagram/X посты без видео)
     images = sorted(
         (
             {
@@ -590,7 +508,7 @@ def get_media_info(url: str, proxy: str | None = None) -> dict:
                 (f.get("vcodec") or "").lower().startswith(("jpeg", "jpg", "png", "webp", "gif", "image"))
                 or (f.get("ext") or "").lower() in ("jpg", "jpeg", "png", "webp", "gif")
             )
-            and int(f.get("width") or f.get("height") or 0) >= 200  # отсекаем иконки/миниатюры
+            and int(f.get("width") or f.get("height") or 0) >= 200
         ),
         key=lambda x: x["width"] * x["height"],
         reverse=True,
@@ -611,13 +529,7 @@ def get_media_info(url: str, proxy: str | None = None) -> dict:
         "thumbnails": info.get("thumbnails") or [],
     }
 
-
 def download(url: str, max_height: int, temp_dir_path: str, reporter: Any, proxy: str | None = None) -> tuple[str, dict]:
-    """
-    Скачивает видео выбранного разрешения в temp_dir_path.
-    reporter: объект с методами update(hook_data) и cancelled() -> bool
-    (вызывается из рабочего потока yt-dlp).
-    """
     def hook(d: dict) -> None:
         if reporter.cancelled():
             raise yt_dlp.utils.DownloadCancelled("Загрузка отменена пользователем")
@@ -633,7 +545,7 @@ def download(url: str, max_height: int, temp_dir_path: str, reporter: Any, proxy
         "noprogress": True,
         "socket_timeout": 30,
         "retries": 3,
-        "concurrent_fragment_downloads": 8,  # экономно и достаточно быстро
+        "concurrent_fragment_downloads": 8,
         "windowsfilenames": True,
         "noplaylist": True,
         "geo_bypass": True,
@@ -658,19 +570,14 @@ def download(url: str, max_height: int, temp_dir_path: str, reporter: Any, proxy
         )
     return filepath, info
 
-
 def download_audio(url: str, temp_dir_path: str, reporter: Any, proxy: str | None = None) -> tuple[str, dict]:
-    """
-    Скачивает только звуковую дорожку и конвертирует в MP3 192 kbps.
-    reporter: объект с методами update(hook_data) и cancelled() -> bool.
-    """
     def hook(d: dict) -> None:
         if reporter.cancelled():
             raise yt_dlp.utils.DownloadCancelled("Загрузка отменена пользователем")
         reporter.update(d)
 
     opts: dict[str, Any] = {
-        "format": "ba[acodec^=mp4a]/ba/b",  # сначала AAC/m4a — обычно без перекодирования видео-потока
+        "format": "ba[acodec^=mp4a]/ba/b",
         "outtmpl": {"default": OUTTMPL},
         "paths": {"home": temp_dir_path},
         "quiet": True,
@@ -678,7 +585,7 @@ def download_audio(url: str, temp_dir_path: str, reporter: Any, proxy: str | Non
         "noprogress": True,
         "socket_timeout": 30,
         "retries": 3,
-        "concurrent_fragment_downloads": 8,  # быстрее качаем крупные видео
+        "concurrent_fragment_downloads": 8,
         "windowsfilenames": True,
         "noplaylist": True,
         "geo_bypass": True,
