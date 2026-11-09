@@ -224,9 +224,11 @@ def apply_cookies(opts: dict[str, Any], *, youtube: bool = False) -> None:
         cf = _resolve_cookies_file() or _cookies_from_b64()
         if cf:
             opts["cookiefile"] = cf
+            log.info("cookies: использую %s", cf)
         browser = (os.environ.get("COOKIES_FROM_BROWSER") or "").strip().lower()
         if browser:
             opts["cookiesfrombrowser"] = (browser,)
+            log.info("cookies: из браузера %s", browser)
     proxy = (os.environ.get("PROXY") or "").strip()
     if proxy:
         opts["proxy"] = proxy
@@ -702,7 +704,11 @@ def friendly_error(exc: BaseException) -> str:
             "«Get cookies.txt LOCALLY» в формате Netscape (не JSON) и обновите COOKIES_B64."
         )
     if "sign in to confirm" in blob or "not a bot" in blob:
-        return "YouTube просит подтвердить, что вы не бот — нужен cookies (COOKIES_B64, см. README_RENDER)."
+        return (
+            "YouTube просит подтвердить, что вы не бот. Нужны СВЕЖИЕ cookies "
+            "(экспорт из инкогнито, COOKIES_B64 — см. README_RENDER). "
+            "Если cookies уже добавлены — они протухли, экспортируйте заново."
+        )
     if "the page needs to be reloaded" in blob:
         return "YouTube попросил перезагрузить страницу. Отправьте ссылку ещё раз."
     if "unavailable" in blob or "video unavailable" in blob:

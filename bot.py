@@ -846,11 +846,25 @@ async def main() -> None:
         "Загрузок одновременно: %d · yt-dlp %s · прокси в пуле: %d",
         MAX_CONCURRENT, yt_dlp.version.__version__, len(downloader.proxy_pool()),
     )
+    cookies_src = "нет"
+    cpath = downloader._resolve_cookies_file() or downloader._cookies_from_b64()
+    if cpath:
+        try:
+            n = sum(
+                1
+                for line in open(cpath, encoding="utf-8", errors="replace")
+                if line.strip() and not line.lstrip().startswith("#")
+            )
+            cookies_src = f"есть ({n} строк, {os.path.basename(cpath)})"
+        except OSError:
+            cookies_src = "есть (не прочитаны)"
     log.info(
-        "ffmpeg: %s · JS-рантаймы: %s · PO Token: %s",
+        "ffmpeg: %s · JS-рантаймы: %s · PO Token: %s · cookies: %s · YOUTUBE_COOKIES=%s",
         "есть" if downloader.ffmpeg_available() else "НЕТ (720p/1080p не соберутся)",
         ",".join(downloader._js_runtimes() or ["нет"]) or "нет",
         "да" if (os.getenv("POT_PROVIDER_URL") or "").strip() else "нет",
+        cookies_src,
+        (os.getenv("YOUTUBE_COOKIES") or "auto"),
     )
     if BOT_PROXY:
         log.info("Telegram API через прокси %s", BOT_PROXY)
