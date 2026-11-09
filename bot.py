@@ -65,6 +65,8 @@ PROXY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxystat
 SEND_TIMEOUT = 36_000
 METADATA_BATCH = 3
 METADATA_RACE_TIMEOUT = 40
+# Без прокси (Render/VPS) метаданные могут думать дольше: 0.1 CPU + JS-челленджи YouTube.
+METADATA_TIMEOUT = int(os.getenv("METADATA_TIMEOUT") or 120)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -189,7 +191,25 @@ def _set_proxy(p: str) -> None:
     _save_proxy_state(PROXY_STATE)
     log.info("Рабочий прокси: %s", p[:40])
 
+async def _get_media_info_direct(url: str) -> dict:
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(downloader.get_media_info, url, None),
+            timeout=METADATA_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"YouTube не ответил за {METADATA_TIMEOUT} с. Отправьте ссылку ещё раз."
+        )
+
+
 async def _get_media_info_rotating(url: str) -> dict:
+    # Без прокси «гонка прокси» не нужна: на бесплатном Render 40 секунд
+    # часто не хватает, и пользователь видел «прокси не ответили за 40 с»
+    # даже без единого прокси в конфиге.
+    if not downloader.proxy_pool():
+        return await _get_media_info_direct(url)
+
     candidates = _proxy_candidates()
     last_exc: Exception | None = None
     for i in range(0, len(candidates), METADATA_BATCH):
