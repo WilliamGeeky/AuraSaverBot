@@ -4,5 +4,4 @@ python-dotenv>=1.0
 requests>=2.31
 aiohttp-socks>=0.9
 PySocks>=1.7
-# Раскомментируйте, если задали POT_PROVIDER_URL (PO Token для серверных IP):
-# bgutil-ytdlp-pot-provider
+bgutil-ytdlp-pot-provider

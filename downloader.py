@@ -203,13 +203,30 @@ def _cookies_from_b64() -> str | None:
     except Exception:
         return None
 
-def apply_cookies(opts: dict[str, Any]) -> None:
-    cf = _resolve_cookies_file() or _cookies_from_b64()
-    if cf:
-        opts["cookiefile"] = cf
-    browser = (os.environ.get("COOKIES_FROM_BROWSER") or "").strip().lower()
-    if browser:
-        opts["cookiesfrombrowser"] = (browser,)
+def is_youtube_url(url: str) -> bool:
+    host = host_of(url)
+    return "youtube" in host or host == "youtu.be"
+
+
+def apply_cookies(opts: dict[str, Any], *, youtube: bool = False) -> None:
+    """Cookies для YouTube по умолчанию выключены (YOUTUBE_COOKIES=auto).
+
+    Авторизованные клиенты YouTube почти всегда отдают только SABR, из-за
+    чего с cookies бывает хуже, чем без них. Cookies нужны для приватных/
+    возрастных видео и иногда для "Sign in to confirm" — тогда YOUTUBE_COOKIES=yes
+    или авторетрай при bot-check.
+    """
+    mode = (os.environ.get("YOUTUBE_COOKIES") or "auto").strip().lower()
+    force = mode in ("1", "yes", "true", "on", "always")
+    never = mode in ("0", "no", "off", "false", "never")
+    use = ((not youtube) or force) and not (never and youtube)
+    if use:
+        cf = _resolve_cookies_file() or _cookies_from_b64()
+        if cf:
+            opts["cookiefile"] = cf
+        browser = (os.environ.get("COOKIES_FROM_BROWSER") or "").strip().lower()
+        if browser:
+            opts["cookiesfrombrowser"] = (browser,)
     proxy = (os.environ.get("PROXY") or "").strip()
     if proxy:
         opts["proxy"] = proxy
@@ -741,10 +758,16 @@ def _unwrap_playlist(info: dict) -> dict:
         return dict(entries[0])
     return info
 
-def _extract_meta(url: str, proxy: str | None, clients: list[str] | None) -> dict:
+def _extract_meta(
+    url: str,
+    proxy: str | None,
+    clients: list[str] | None,
+    *,
+    yt_cookies: bool = False,
+) -> dict:
     opts = _base_opts()
     _apply_clients(opts, clients)
-    apply_cookies(opts)
+    apply_cookies(opts, youtube=is_youtube_url(url) and not yt_cookies)
     if proxy:
         opts["proxy"] = proxy
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -808,31 +831,67 @@ def _media_info_from_raw(info: dict, url: str) -> dict:
     }
 
 
+def _looks_like_bot_check(exc: BaseException | None, info: dict | None = None) -> bool:
+    blob = (str(exc) if exc else "") + " " + str((info or {}).get("playability_status") or "")
+    blob = blob.lower()
+    keys = (
+        "sign in to confirm",
+        "not a bot",
+        "войдите",
+        "login_required",
+        "bots are blocked",
+        "unusual traffic",
+    )
+    return any(k in blob for k in keys)
+
+
 def get_media_info(url: str, proxy: str | None = None) -> dict:
     last_exc: Exception | None = None
     empty: dict | None = None
-    for clients in _client_chains():
-        try:
-            info = _extract_meta(url, proxy, clients)
-        except yt_dlp.utils.DownloadCancelled:
-            raise
-        except Exception as exc:
-            last_exc = exc
-            log.info(
-                "метаданные (%s): %s",
-                ",".join(clients) if clients else "default",
-                str(exc).splitlines()[-1][:140],
-            )
-            continue
-        if any(_is_av_format(f) for f in (info.get("formats") or [])):
+    bot_check = False
+    yt = is_youtube_url(url)
+
+    def run_chains(yt_cookies: bool) -> dict | None:
+        nonlocal last_exc, empty, bot_check
+        for clients in _client_chains():
+            try:
+                info = _extract_meta(url, proxy, clients, yt_cookies=yt_cookies)
+            except yt_dlp.utils.DownloadCancelled:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                bot_check = bot_check or _looks_like_bot_check(exc)
+                log.info(
+                    "метаданные (%s): %s",
+                    ",".join(clients) if clients else "default",
+                    str(exc).splitlines()[-1][:140],
+                )
+                continue
+            bot_check = bot_check or _looks_like_bot_check(None, info)
+            if any(_is_av_format(f) for f in (info.get("formats") or [])):
+                return info
+            if empty is None:
+                empty = info
+        return None
+
+    # Без cookies: авторизованные клиенты YouTube обычно отдают только SABR.
+    info = run_chains(yt_cookies=False)
+    if info:
+        return _media_info_from_raw(info, url)
+
+    # С cookies — только если похоже на bot-check / вход, либо YOUTUBE_COOKIES=yes.
+    mode = (os.environ.get("YOUTUBE_COOKIES") or "auto").strip().lower()
+    force = mode in ("1", "yes", "true", "on", "always")
+    if yt and (force or (bot_check and mode not in ("0", "no", "off", "false", "never"))):
+        log.info("повтор метаданных с cookies (bot_check=%s)", bot_check)
+        info = run_chains(yt_cookies=True)
+        if info:
             return _media_info_from_raw(info, url)
-        if empty is None:
-            empty = info
 
     # Второй шанс: обычная обработка yt-dlp (нужна части сайтов, не YouTube).
     try:
         opts = _base_opts()
-        apply_cookies(opts)
+        apply_cookies(opts, youtube=yt)
         if proxy:
             opts["proxy"] = proxy
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -936,7 +995,7 @@ def download(
         opts = _download_common(temp_dir_path, hook)
         opts.update(extra)
         _merge_pot(opts)
-        apply_cookies(opts)
+        apply_cookies(opts, youtube=is_youtube_url(url))
         if proxy:
             opts["proxy"] = proxy
         label = extra.get("format") or extra.get("format_sort") or "?"
@@ -1002,7 +1061,7 @@ def download_audio(
         opts = _download_common(temp_dir_path, hook)
         opts.update(extra)
         _merge_pot(opts)
-        apply_cookies(opts)
+        apply_cookies(opts, youtube=is_youtube_url(url))
         if proxy:
             opts["proxy"] = proxy
         log.info("скачиваю аудио: %s", extra.get("format") or "?")

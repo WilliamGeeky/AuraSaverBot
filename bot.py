@@ -439,8 +439,7 @@ async def _handle_link_message(message: Message) -> None:
         lines.append(f"🍿 <b>{html.escape(_clip(quick_title, 180))}</b>")
     lines.append(f"🔗 {html.escape(_clip(url, 300))}")
     lines.append("")
-    lines.append("Выбери качество (или 🎧 Audio):")
-    kb0 = build_keyboard(0, {}, user_id)
+    lines.append("⏳ Ищу качество…")
     preview: Message | None = None
     try:
         if cover:
@@ -448,7 +447,6 @@ async def _handle_link_message(message: Message) -> None:
                 preview = await message.answer_photo(
                     photo=FSInputFile(cover),
                     caption="\n".join(lines),
-                    reply_markup=kb0,
                 )
             except TelegramBadRequest:
                 preview = None
@@ -609,8 +607,11 @@ async def _send_media(send: Any, **kwargs: Any) -> None:
 
 @dp.callback_query(F.data.startswith("dl:"))
 async def cb_download(cb: CallbackQuery) -> None:
-    if not cb.message or not bot:
+    log.info("callback %s", cb.data)
+    if not bot:
         return
+    if not cb.message:
+        return await _ack(cb, "Сообщение устарело — пришли ссылку заново 🙂", alert=True)
     parts = (cb.data or "").split(":")
     kind = parts[1] if len(parts) > 1 else ""
     mid = parts[-1]
@@ -623,13 +624,24 @@ async def cb_download(cb: CallbackQuery) -> None:
         return await _ack(cb, "Это чужой запрос — пришли себе такую же ссылку 🙂", alert=True)
 
     if st.get("info") is None:
-        await _ack(cb, "⏳ Секунду, добираю данные…")
+        await _ack(cb, "⏳ Ещё получаю данные…")
+        await _edit_preview(cb.message, "⏳ Добираю данные о качестве, это может занять минуту…")
         try:
-            await asyncio.wait_for(st["done"].wait(), timeout=90)
+            await asyncio.wait_for(st["done"].wait(), timeout=METADATA_TIMEOUT)
         except asyncio.TimeoutError:
             PENDING.pop(mid, None)
             await _edit_preview(cb.message, "⌛ Не успел получить данные. Пришли ссылку ещё раз.")
             return
+        # данные пришли — рисуем кнопки и продолжаем выбранное качество
+        info0 = st.get("info")
+        if info0 and not st.get("failed"):
+            try:
+                await cb.message.edit_caption(
+                    caption=_preview_caption(info0, st.get("url") or ""),
+                    reply_markup=build_keyboard(0, info0, st.get("user_id") or cb.from_user.id),
+                )
+            except Exception:
+                pass
     if st.get("failed"):
         PENDING.pop(mid, None)
         return await _ack(cb, "Не удалось обработать это видео 🙂", alert=True)
